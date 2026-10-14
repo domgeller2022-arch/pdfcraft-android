@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PdfCraft</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            background: #f1f1f3;
+        }
+        @media (prefers-color-scheme: dark) {
+            html, body { background: #19191c; }
+        }
+        #pdfcraft-frame {
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <iframe
+        id="pdfcraft-frame"
+        title="PdfCraft"
+        src="../pdfcraft/index.html?host=parent"
+        allow="fullscreen; clipboard-read; clipboard-write"
+        allowfullscreen>
+    </iframe>
+    <script src="host.js"></script>
+    <!-- Download adapter injected as document-start to intercept Blob downloads before app scripts run.
+         Feature-checked at load time; degrades gracefully if the API is unavailable. -->
+    <script src="download-adapter.js"></script>
+</body>
+</html>

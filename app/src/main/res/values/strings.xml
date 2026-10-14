@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PdfCraft</string>
+    <string name="error_generic">Something went wrong with PdfCraft.</string>
+    <string name="retry">Retry</string>
+    <string name="error_webview">The WebView renderer crashed. PdfCraft needs to be restarted.</string>
+    <string name="save_prompt">Save changes before closing?</string>
+    <string name="stay">Stay</string>
+    <string name="discard">Discard</string>
+    <string name="cancel">Cancel</string>
+    <string name="save">Save</string>
+    <string name="export_pending">Pending export. Tap to continue.</string>
+</resources>

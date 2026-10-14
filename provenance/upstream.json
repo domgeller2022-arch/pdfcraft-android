@@ -1,0 +1,41 @@
+{
+  "description": "PdfCraft upstream provenance record for Android packaging project",
+  "generated": "2026-10-14",
+  "upstream": {
+    "repository": "https://github.com/domgeller2022-arch/pdfcraft",
+    "pinned_commit": "bbbe60015c571ebfc39708ee07777b89e267122a",
+    "commit_message": "M10: Windows printing prints at actual size, off the UI thread (follow-up to #847) (#1007)",
+    "status_clean": true,
+    "tracked_file_count": 1261,
+    "aggregate_hash": "ea805aee74b427bbdfee1d3483ba8e5453e9efa03d75d8f32d21935dac552a4f"
+  },
+  "build_inputs": {
+    "craft_fonts": {
+      "repository": "https://github.com/storytold/craft-fonts",
+      "pinned_commit": "8dcdacd5153e64560d109541a47d806f26f048c0",
+      "commit_message": "Fonts: Noto Sans CJK SC and Noto Sans Arabic"
+    },
+    "rust": {
+      "required_minimum": "1.95.0",
+      "installed": "1.99.0"
+    },
+    "trunk": "0.21.14",
+    "target": "wasm32-unknown-unknown"
+  },
+  "key_file_hashes": {
+    "Cargo.lock": "2df3987bb56b353fbc6ac3377a8c46371c04c8d52ea01bd9363e97c8a6d86ae1",
+    "Cargo.toml": "b539048a7790d45983e9f4638ccbde0bd7e2de4f108f99ff8f75efe48bb4784d",
+    "apps/pdfcraft-web/src/main.rs": "48501a5c6a35e56b78502342a0ae5478b7e34e2e6379f33671487f08613ef72b",
+    "apps/pdfcraft-web/Trunk.toml": "c8423f44822bf4d650a9e565a95c67be894ec08b77ddfdb1e205eae4a2233ac3",
+    "apps/pdfcraft-web/index.html": "139837866320cf67a49e49f5ccc6c6b58e0bfeec8128833fc13dce259a5eac31",
+    "apps/pdfcraft-web/Cargo.toml": "fc0e3c1398f687670df8dd48d609f16edceec7b8fffa82cc8ccb862d8af72900",
+    "AGENTS.md": "b3d762b30b79e4574a7a3eb7587b09a5724c23ed7856068f2661ebaecb95400b",
+    "CLAUDE.md": "6476458c7325e1e0baaf8be59f1762e03b6c6bfbe8a0f2889784bf867ec5019e",
+    "NOTICE": "8df0defad7f2a06fd60a9b3bf439272abfcb90b5ebd0adb177f4479edd313c9e"
+  },
+  "toolchain_versions": {
+    "rustc": "1.99.0",
+    "cargo": "1.99.0",
+    "trunk": "0.21.14"
+  }
+}

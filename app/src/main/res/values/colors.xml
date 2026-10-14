@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="md_theme_light_primary">#006d37</color>
+    <color name="md_theme_light_onPrimary">#ffffff</color>
+    <color name="md_theme_light_secondary">#668759</color>
+    <color name="md_theme_light_onSecondary">#ffffff</color>
+    <color name="md_theme_light_background">#fcfcfc</color>
+    <color name="md_theme_light_onBackground">#1c1c1e</color>
+    <color name="md_theme_light_error">#ba0000</color>
+    <color name="md_theme_light_onError">#ffffff</color>
+
+    <color name="md_theme_dark_primary">#00bd60</color>
+    <color name="md_theme_dark_onPrimary">#000000</color>
+    <color name="md_theme_dark_secondary">#82b56f</color>
+    <color name="md_theme_dark_onSecondary">#000000</color>
+    <color name="md_theme_dark_background">#0c0c0c</color>
+    <color name="md_theme_dark_onBackground">#e5e5e6</color>
+    <color name="md_theme_dark_error">#ff6b6b</color>
+    <color name="md_theme_dark_onError">#000000</color>
+
+    <!-- Matches PdfCraft's default background color (#f1f1f3 / #19191c) -->
+    <color name="pdfcraft_bg_light">#f1f1f3</color>
+    <color name="pdfcraft_bg_dark">#19191c</color>
+</resources>

@@ -1,0 +1,19 @@
+[versions]
+agp = "8.12.0"
+kotlin = "2.2.0"
+coreKtx = "1.16.0"
+activity = "1.10.0"
+webkit = "1.12.0"
+window = "1.4.0"
+material = "1.12.0"
+
+[ libraries ]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "activity" }
+androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "webkit" }
+androidx-window = { group = "androidx.window", name = "window", version.ref = "window" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+
+[ plugins ]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
