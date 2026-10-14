@@ -1,6 +1,8 @@
 package com.domgeller.pdfcraft
 
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.webkit.WebView
@@ -13,13 +15,11 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * HostMessageBridge — origin-restricted AndroidX WebKit WebMessageListener
  * that bridges between the Android shell and the host page (host.js).
- *
- * Protocol: all messages are JSON strings; binary data is base64-encoded inline.
- * Small files (< 256 KiB): single message. Large files: chunked protocol.
  */
 class HostMessageBridge(
     private val webView: WebView,
@@ -27,6 +27,7 @@ class HostMessageBridge(
     private val bridgeObjectName: String = "WebMessageListener",
     private val stagingDir: File,
     private val metadataDir: File,
+    private val exportQueue: ExportQueue = ExportQueue(stagingDir, metadataDir),
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
     private val callback: BridgeCallback
 ) : WebViewCompat.WebMessageListener {
@@ -45,24 +46,17 @@ class HostMessageBridge(
         fun onAppFailed(error: String)
     }
 
-    private val exportQueue: ExportQueue = ExportQueue(stagingDir, metadataDir)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val importCounter = AtomicLong(0L)
+
+    @Volatile
     private var appReady = false
+
+    @Volatile
     private var appVersion: String? = null
+
+    @Volatile
     private var isDestroyed = false
-
-    // Chunked transfers currently in progress
-    private val chunkedTransfers = mutableMapOf<String, ChunkedTransfer>()
-
-    data class ChunkedTransfer(
-        val transferId: String,
-        val name: String,
-        val saveAs: Boolean,
-        val totalBytes: Long,
-        val totalChunks: Int,
-        val chunks: MutableMap<Int, ByteArray>
-    ) {
-        fun isComplete(): Boolean = chunks.size >= totalChunks
-    }
 
     fun register() {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
@@ -70,9 +64,6 @@ class HostMessageBridge(
             callback.onAppFailed("WebView does not support WEB_MESSAGE_LISTENER")
             return
         }
-        // Inject download-adapter.js as a document-start script so it intercepts
-        // Blob downloads inside the iframe before upstream app scripts run.
-        // The adapter self-exits on the host page via pathname check.
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             val adapterScript = readAsset("shell/download-adapter.js")
             if (adapterScript != null) {
@@ -105,12 +96,16 @@ class HostMessageBridge(
     override fun onPostMessage(
         view: WebView,
         message: WebMessageCompat,
-        uri: Uri,
+        sourceOrigin: Uri,
         isMainFrame: Boolean,
         replyProxy: JavaScriptReplyProxy
     ) {
         if (isDestroyed) return
         if (!isMainFrame) return
+        if (sourceOrigin.toString() != assetOrigin) {
+            Log.w(TAG, "Rejected WebMessage from unexpected origin: $sourceOrigin")
+            return
+        }
 
         val payload = message.data ?: return
         executor.execute {
@@ -143,14 +138,18 @@ class HostMessageBridge(
             }
 
             "host:save" -> {
-                val transferId = json.optString("transferId", "")
+                val transferId = json.optString("transferId", "save_" + System.currentTimeMillis())
                 val name = json.optString("name", "document.pdf")
                 val saveAs = json.optBoolean("saveAs", false)
+                val mimeType = json.optString("mimeType", "").takeIf { it.isNotBlank() }
+                val expectedSha256 = json.optString("sha256", "").takeIf { it.isNotBlank() }
+                val declaredBytes = json.optLong("totalBytes", -1L)
                 val bytes = decodeBase64(json.optString("bytes"))
-                if (bytes != null) {
-                    handleSave(transferId, name, saveAs, bytes)
+                if (bytes != null && (declaredBytes < 0L || bytes.size.toLong() == declaredBytes)) {
+                    handleSave(transferId, name, saveAs, bytes, mimeType, expectedSha256)
                 } else {
-                    Log.e(TAG, "host:save: invalid or missing bytes")
+                    Log.e(TAG, "host:save: invalid or size-mismatched payload")
+                    callback.onSaveCompleted(transferId, false, "Invalid save payload")
                 }
             }
 
@@ -158,142 +157,220 @@ class HostMessageBridge(
                 val transferId = json.optString("transferId", "")
                 val name = json.optString("name", "document.pdf")
                 val saveAs = json.optBoolean("saveAs", false)
-                val totalBytes = json.optLong("totalBytes", 0)
-                val seq = json.optInt("seq", 0)
-                val totalChunks = json.optInt("totalChunks", 1)
+                val mimeType = json.optString("mimeType", "").takeIf { it.isNotBlank() }
+                val totalBytes = json.optLong("totalBytes", 0L)
+                val seq = json.optInt("seq", -1)
+                val totalChunks = json.optInt("totalChunks", 0)
                 val chunkBytes = decodeBase64(json.optString("data"))
+                val declaredChunkLen = json.optInt("chunkLength", chunkBytes?.size ?: -1)
 
-                chunkBytes?.let {
-                    handleSaveChunk(transferId, name, saveAs, totalBytes, totalChunks, seq, it)
+                if (transferId.isBlank() || chunkBytes == null) {
+                    Log.e(TAG, "host:saveChunk: invalid chunk payload for $transferId")
+                    sendChunkAck(transferId, seq, false, "Invalid chunk payload")
+                    callback.onSaveCompleted(transferId, false, "Invalid chunk payload")
+                    return
                 }
+                handleSaveChunk(
+                    transferId,
+                    name,
+                    saveAs,
+                    totalBytes,
+                    totalChunks,
+                    seq,
+                    declaredChunkLen,
+                    chunkBytes,
+                    mimeType
+                )
             }
 
             "host:saveComplete" -> {
                 val transferId = json.optString("transferId", "")
                 val name = json.optString("name", "document.pdf")
                 val saveAs = json.optBoolean("saveAs", false)
-                val totalBytes = json.optLong("totalBytes", 0)
-                finalizeChunkedSave(transferId, name, saveAs, totalBytes)
+                val mimeType = json.optString("mimeType", "").takeIf { it.isNotBlank() }
+                val totalBytes = json.optLong("totalBytes", 0L)
+                val expectedSha256 = json.optString("sha256", "").takeIf { it.isNotBlank() }
+                if (transferId.isNotBlank()) {
+                    finalizeChunkedSave(transferId, name, saveAs, totalBytes, mimeType, expectedSha256)
+                }
             }
 
             "host:blobDownload" -> {
                 val transferId = json.optString("transferId", "blob_" + System.currentTimeMillis())
                 val name = json.optString("filename", json.optString("name", "download.pdf"))
+                val mimeType = json.optString("mimeType", "").takeIf { it.isNotBlank() }
+                val expectedSha256 = json.optString("sha256", "").takeIf { it.isNotBlank() }
+                val declaredBytes = json.optLong("totalBytes", -1L)
                 val bytes = decodeBase64(json.optString("bytes"))
-                if (bytes != null) {
-                    handleSave(transferId, name, false, bytes)
+                if (bytes != null && (declaredBytes < 0L || bytes.size.toLong() == declaredBytes)) {
+                    handleSave(transferId, name, true, bytes, mimeType, expectedSha256)
                 } else {
-                    Log.e(TAG, "host:blobDownload: invalid or missing bytes")
+                    Log.e(TAG, "host:blobDownload: invalid or size-mismatched payload")
+                    callback.onSaveCompleted(transferId, false, "Invalid blob download payload")
                 }
             }
         }
     }
 
-    private fun handleSave(transferId: String, name: String, saveAs: Boolean, bytes: ByteArray) {
-        Log.d(TAG, "Save: $name, ${bytes.size} bytes, saveAs=$saveAs")
+    private fun handleSave(
+        transferId: String,
+        name: String,
+        saveAs: Boolean,
+        bytes: ByteArray,
+        mimeType: String?,
+        expectedSha256: String?
+    ) {
         try {
-            val job = exportQueue.stageExport(transferId, name, saveAs, bytes)
+            val job = exportQueue.stageExport(transferId, name, saveAs, bytes, mimeType, expectedSha256)
             callback.onSaveStaged(transferId, job)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to stage save: ${e.message}", e)
+            sendSaveResult(transferId, false, e.message)
             callback.onSaveCompleted(transferId, false, e.message)
         }
     }
 
     private fun handleSaveChunk(
-        transferId: String, name: String, saveAs: Boolean,
-        totalBytes: Long, totalChunks: Int, seq: Int, chunkBytes: ByteArray
+        transferId: String,
+        name: String,
+        saveAs: Boolean,
+        totalBytes: Long,
+        totalChunks: Int,
+        seq: Int,
+        declaredChunkLen: Int,
+        chunkBytes: ByteArray,
+        mimeType: String?
     ) {
         try {
-            var transfer = chunkedTransfers[transferId]
-            if (transfer == null) {
-                transfer = ChunkedTransfer(
-                    transferId = transferId,
-                    name = name,
-                    saveAs = saveAs,
-                    totalBytes = totalBytes,
-                    totalChunks = totalChunks,
-                    chunks = mutableMapOf()
-                )
-                chunkedTransfers[transferId] = transfer
-            }
-            transfer.chunks[seq] = chunkBytes
-
-            if (transfer.isComplete()) {
-                chunkedTransfers.remove(transferId)
-                val total = transfer.chunks.values.sumOf { it.size }
-                val combined = ByteArray(total)
-                var offset = 0
-                // Sort by sequence to ensure correct order
-                for (i in 0 until totalChunks) {
-                    val chunk = transfer.chunks[i] ?: continue
-                    System.arraycopy(chunk, 0, combined, offset, chunk.size)
-                    offset += chunk.size
-                }
-                handleSave(transferId, name, saveAs, combined)
-            }
+            exportQueue.receiveChunk(
+                transferId = transferId,
+                name = name,
+                saveAs = saveAs,
+                totalBytes = totalBytes,
+                totalChunks = totalChunks,
+                seq = seq,
+                chunkLength = declaredChunkLen,
+                data = chunkBytes,
+                mimeType = mimeType
+            )
+            sendChunkAck(transferId, seq, true, null)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to handle save chunk: ${e.message}", e)
+            Log.e(TAG, "Failed to stream save chunk ($transferId, seq=$seq): ${e.message}", e)
+            sendChunkAck(transferId, seq, false, e.message)
+            sendSaveResult(transferId, false, e.message)
+            callback.onSaveCompleted(transferId, false, e.message)
         }
     }
 
-    private fun finalizeChunkedSave(transferId: String, name: String, saveAs: Boolean, totalBytes: Long) {
-        // Chunks are finalized in handleSaveChunk when all received.
-        // This method is kept for protocol completeness.
-        Log.d(TAG, "finalizeChunkedSave: $transferId (totalBytes=$totalBytes)")
+    private fun finalizeChunkedSave(
+        transferId: String,
+        name: String,
+        saveAs: Boolean,
+        totalBytes: Long,
+        mimeType: String?,
+        expectedSha256: String?
+    ) {
+        try {
+            val job = exportQueue.finalizeChunkedExport(
+                transferId = transferId,
+                name = name,
+                saveAs = saveAs,
+                totalBytes = totalBytes,
+                mimeType = mimeType,
+                expectedSha256 = expectedSha256
+            )
+            callback.onSaveStaged(transferId, job)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to finalize chunked save ($transferId): ${e.message}", e)
+            sendSaveResult(transferId, false, e.message)
+            callback.onSaveCompleted(transferId, false, e.message)
+        }
     }
 
-    /**
-     * Send a JSON string message to the host page via postWebMessage.
-     */
     fun sendToHost(message: String) {
         if (isDestroyed) return
-        val webMessage = WebMessageCompat(message)
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.POST_WEB_MESSAGE)) {
-            WebViewCompat.postWebMessage(webView, webMessage, Uri.parse(assetOrigin))
+        val deliver = Runnable {
+            if (isDestroyed) return@Runnable
+            val webMessage = WebMessageCompat(message)
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.POST_WEB_MESSAGE)) {
+                WebViewCompat.postWebMessage(webView, webMessage, Uri.parse(assetOrigin))
+            } else {
+                Log.e(TAG, "POST_WEB_MESSAGE not supported")
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            deliver.run()
         } else {
-            Log.e(TAG, "POST_WEB_MESSAGE not supported")
+            mainHandler.post(deliver)
         }
     }
 
-    /**
-     * Import a PDF from Android (intent or file picker) by sending bytes to the host page,
-     * which forwards them to the iframe as pdfcraft:open.
-     */
     fun sendImport(name: String, bytes: ByteArray) {
+        val sha256 = DocumentIo.sha256(bytes)
         if (bytes.size <= CHUNK_SIZE) {
-            // Single message — base64-encode inline
-            sendToHost("""{"type":"host:import","name":"${escapeJson(name)}","bytes":"${encodeBase64(bytes)}"}""")
+            val payload = JSONObject().apply {
+                put("type", "host:import")
+                put("name", name)
+                put("totalBytes", bytes.size)
+                put("sha256", sha256)
+                put("bytes", encodeBase64(bytes))
+            }.toString()
+            sendToHost(payload)
         } else {
-            // Chunked transfer
-            val transferId = "import:" + System.currentTimeMillis()
+            val transferId = "import_${System.currentTimeMillis()}_${importCounter.incrementAndGet()}"
             val totalChunks = (bytes.size + CHUNK_SIZE - 1) / CHUNK_SIZE
             for (i in 0 until totalChunks) {
                 val start = i * CHUNK_SIZE
                 val end = minOf(start + CHUNK_SIZE, bytes.size)
                 val chunk = bytes.copyOfRange(start, end)
-                sendToHost(
-                    """{"type":"host:importChunk","transferId":"$transferId","name":"${escapeJson(name)}","totalBytes":${bytes.size},"seq":$i,"totalChunks":$totalChunks,"data":"${encodeBase64(chunk)}"}"""
-                )
+                val payload = JSONObject().apply {
+                    put("type", "host:importChunk")
+                    put("transferId", transferId)
+                    put("name", name)
+                    put("totalBytes", bytes.size)
+                    put("seq", i)
+                    put("totalChunks", totalChunks)
+                    put("sha256", sha256)
+                    put("data", encodeBase64(chunk))
+                }.toString()
+                sendToHost(payload)
             }
         }
     }
 
-    fun sendSaveResult(transferId: String, success: Boolean, error: String? = null) {
-        val err = if (error != null) """"error":"${escapeJson(error)}"""" else ""
-        sendToHost("""{"type":"host:saveResult","transferId":"$transferId","success":$success,$err}""")
+    private fun sendChunkAck(transferId: String, seq: Int, success: Boolean, error: String?) {
+        val payload = JSONObject().apply {
+            put("type", "host:saveChunkAck")
+            put("transferId", transferId)
+            put("seq", seq)
+            put("success", success)
+            if (error != null) {
+                put("error", error)
+            }
+        }.toString()
+        sendToHost(payload)
     }
 
+    fun sendSaveResult(transferId: String, success: Boolean, error: String? = null) {
+        val payload = JSONObject().apply {
+            put("type", "host:saveResult")
+            put("transferId", transferId)
+            put("success", success)
+            if (error != null) {
+                put("error", error)
+            }
+        }.toString()
+        sendToHost(payload)
+    }
+
+    fun hasInFlightTransfers(): Boolean = exportQueue.hasInFlightTransfers()
     fun isAppReady(): Boolean = appReady
     fun getAppVersion(): String? = appVersion
-
-    private fun escapeJson(s: String): String =
-        s.replace("\\", "\\\\").replace("\"", "\\\"")
-            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     private fun encodeBase64(data: ByteArray): String =
         Base64.encodeToString(data, Base64.NO_WRAP)
 
     private fun decodeBase64(data: String): ByteArray? =
-        try { Base64.decode(data, Base64.NO_WRAP) } catch (e: Exception) { null }
+        if (data.isBlank()) null
+        else try { Base64.decode(data, Base64.NO_WRAP) } catch (e: Exception) { null }
 }

@@ -5,96 +5,87 @@ All notable changes to the PdfCraft Android wrapper are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — audit remediation (2026-10-15)
+## [Unreleased] — Round 3 & 4 comprehensive audit remediation (2026-10-15)
 
-Remediation of findings from an external audit of commit `858c43c`. Verified on a debug
-build with `JAVA_HOME='/Users/dd/Library/Java/jdk-17.0.20.1+1/Contents/Home'`.
+Remediation of post-`c285ad4` audit findings and external auditor supplement.
 
-### Fixed — build blockers
-- **`HostMessageBridge.kt`**: call `WebViewCompat.addDocumentStartJavaScript(...)`. The
-  pinned AndroidX WebKit 1.12.0 API does not expose `addDocumentStartScript`.
-- **`gradle/libs.versions.toml`**: pin Robolectric to the published `4.13` (`4.13.2` is
-  not published in the configured repositories).
+### Fixed — transfer protocol validation, checksums, & backpressure
+- **`host.js` / `HostMessageBridge.kt` / `ExportQueue.kt`**: compute and verify independent
+  FIPS 180-4 SHA-256 sender checksums across both single-shot (`host:save`, `host:blobDownload`,
+  `host:import`) and chunked (`host:saveChunk` + `host:saveComplete`, `host:importChunk`)
+  transfers.
+- **`host.js`**: enforce strict sequential ordering (`seq === expectedSeq`), duplicate-chunk
+  rejection, metadata consistency checks, exact byte-length verification, concurrency limits
+  (`MAX_CONCURRENT_IMPORTS = 4`), and 60s transfer timeouts in `handleImportChunk` (fixing the
+  reproduced bug where sending chunk 0 twice triggered early assembly and threw on `undefined`).
+- **`host.js` / `HostMessageBridge.kt`**: implement per-chunk `host:saveChunkAck` backpressure
+  and a bounded outbound export queue so large saves stream one 256 KiB chunk at a time to
+  disk rather than flooding WebView IPC or buffering whole files in heap memory.
+- **`host.js`**: slice `ArrayBuffer.isView` payloads to `[byteOffset, byteOffset + byteLength]`
+  so sub-view exports (such as a 4-byte view over a 6-byte backing `ArrayBuffer`) export only
+  the view's exact range.
 
-### Fixed — startup / asset loading
-- **`LocalContentServer.kt`**: register the `WebViewAssetLoader` under `/assets/` instead
-  of `/shell/`, `/pdfcraft/`, and `/`. The old mapping made `/assets/shell/host.html`
-  resolve to the nonexistent APK path `assets/assets/shell/host.html`, so the app could
-  not start.
-- **`LocalContentServer.kt`**: validate requested paths, reject `.`/`..` traversal, and
-  return a local 404 instead of falling through to network access.
-- **`MainActivity.kt`**: route `shouldInterceptRequest` through
-  `localContentServer.interceptRequest(...)` and surface main-frame load errors.
+### Fixed — crash-safe metadata, orphan reconciliation, & picker recreation state
+- **`DocumentIo.kt` / `ExportQueue.kt`**: replace non-atomic fallback writes with NIO
+  `Files.move(..., REPLACE_EXISTING, ATOMIC_MOVE)` after `fd.sync()` for both private stage
+  files and `.job` metadata files.
+- **`ExportQueue.kt`**: add orphan stage-file reconciliation during `recoverPendingExports` so
+  a crash between syncing the PDF stage file and committing its `.job` metadata (or a truncated
+  `.job` file) still recovers the staged PDF on next launch.
+- **`ExportQueue.kt` / `MainActivity.kt` / `PdfCraftApplication.kt`**: persist the active
+  destination-picker job ID and queued picker IDs across Activity recreation and process death
+  (via `savedInstanceState` and `picker_state.prop`), and move `ioExecutor` to
+  `PdfCraftApplication` so Activity recreation never orphans an in-flight picker result or
+  aborts a background disk copy.
 
-### Fixed — native ↔ web bridge
-- **`MainActivity.kt` / `HostMessageBridge.kt`**: register the message listener as
-  `WebMessageListener` instead of `"/"`, so `window.WebMessageListener` exists in the page.
-- **`HostMessageBridge.kt`**: use `setOf(assetOrigin)` as the permitted-origin set instead
-  of `emptySet()`.
-- **`host.js`**: parse JSON string payloads delivered by `WebViewCompat.postWebMessage`.
-- **`host.js`**: generate save transfer IDs with a monotonic counter suffix so
-  same-millisecond saves cannot collide.
-- **`host.js`**: make buffer type detection realm-agnostic (`Object.prototype.toString` +
-  `ArrayBuffer.isView`); `instanceof` is unreliable for messages crossing the
-  iframe↔parent boundary.
+### Fixed — phone-safe import limits & 3-state destination verification
+- **`DocumentIo.kt`**: enforce a 100 MiB phone-safe import limit (`MAX_IMPORT_BYTES`) during
+  dynamic stream reading (with an early advisory check against `OpenableColumns.SIZE` and an
+  `OutOfMemoryError` guard).
+- **`DocumentIo.kt` / `MainActivity.kt`**: introduce 3-state `VerificationResult`
+  (`VERIFIED`, `UNAVAILABLE`, `MISMATCH`) so write-only or cloud SAF providers that accept the
+  write but disallow read-back are distinguished from actual checksum mismatches, and surface
+  visible recovery dialogs (`Save to device… / Share via Android… / Keep pending / Discard`)
+  on all save or staging errors.
 
-### Fixed — export / blob downloads
-- **`host.js`**: handle `host:blobDownload` in the validated iframe branch. It was
-  previously in the native-message branch, which is unreachable because the iframe branch
-  returns first.
-- **`download-adapter.js`**: add an idempotent installation guard so the document-start
-  injection and the iframe-load fallback cannot stack hooks and emit duplicate exports.
-- **`download-adapter.js`**: return the real `URL.createObjectURL` result instead of a
-  fabricated `blob:N` URL, and drop the duplicate `Document.createElement` click
-  interception.
-- **`host.html`**: stop loading the adapter on the host page (it self-exits there); it is
-  now injected into the iframe.
+### Fixed — file chooser, MIME handling, bridge threading, & Fold7 lifecycle
+- **`PdfCraftChromeClient.kt`**: normalize upstream `rfd` file-extension filters (`.pdf`,
+  `.png`, `.jpg`, `.json`, `.xfdf`, `.txt`, `.svg`, and comma-separated lists) into valid
+  Android MIME types for `Intent.EXTRA_MIME_TYPES`, and complete any superseded
+  `uploadCallback` with `null` before replacement.
+- **`MainActivity.kt` / `HostMessageBridge.kt`**: wrap `onAppReady` and `onDirtyChanged` in
+  `runOnUiThread` (fixing the caught background-thread `WebViewCompat.postWebMessage`
+  exception that caused incoming intent imports to fail and be logged as errors), enforce
+  main-Looper delivery in `sendToHost`, and validate `sourceOrigin == assetOrigin`.
+- **`host.js` / `host.html` / `download-adapter.js`**: defer iframe `src` assignment until
+  after message listeners are registered; accept Chromium WebView's `event.origin === ""` on
+  native `postWebMessage` string deliveries; revoke non-download Blob URLs after a grace
+  window; and suppress default `blob:` navigation on captured anchor clicks.
+- **`MainActivity.kt` / `AndroidManifest.xml` / `res/xml/file_paths.xml`**: remove
+  `webView.pauseTimers()` from `onPause()`, implement `onRenderProcessGone` and a 25s startup
+  watchdog, add an unexported `FileProvider` for outbound Share of staged exports, and use
+  `ViewCompat.setOnApplyWindowInsetsListener` with the union of
+  `systemBars() or displayCutout() or ime()`.
+- **`app/build.gradle.kts` / `scripts/` / `docs/COMPATIBILITY.md`**: add `verifyAndSyncWebAssets`
+  `preBuild` task, optional release keystore signing, portable script paths, and
+  `docs/COMPATIBILITY.md`.
 
-### Fixed — document I/O
-- **`DocumentIo.kt`**: read document bytes dynamically. The previous implementation trusted
-  the provider-reported `OpenableColumns.SIZE` and could truncate or zero-pad the result.
+## [Unreleased] — Round 1 & 2 audit remediation (`c285ad4`, 2026-10-15)
 
-### Fixed — Android 16 / lint
-- **`MainActivity.kt`**: replace the deprecated `onBackPressed()` / `KeyEvent.KEYCODE_BACK`
-  handling with an AndroidX `OnBackPressedDispatcher` callback (required for API 36
-  predictive back).
-- **`themes.xml` / `values-v27/themes.xml`**: move `android:windowLayoutInDisplayCutoutMode`
-  into `values-v27` (it requires API 27; `minSdk` is 26).
+Remediation of initial findings from the audit of commit `858c43c`:
+- **`HostMessageBridge.kt`**: call `WebViewCompat.addDocumentStartJavaScript(...)` and register
+  listener as `"WebMessageListener"` with `setOf(assetOrigin)`.
+- **`gradle/libs.versions.toml`**: pin Robolectric `4.13` (note: `gradle-wrapper.jar` was
+  already tracked in `858c43c` and `c285ad4`).
+- **`LocalContentServer.kt` / `MainActivity.kt`**: register `WebViewAssetLoader` under
+  `/assets/` and surface main-frame load errors.
+- **`host.js` / `download-adapter.js`**: parse JSON strings from `postWebMessage`, move
+  `host:blobDownload` into the iframe branch, add idempotency guard, and preserve real Blob URLs.
+- **`DocumentIo.kt`**: read document bytes dynamically instead of trusting `OpenableColumns.SIZE`.
+- **`MainActivity.kt` / `values-v27/themes.xml`**: migrate to `OnBackPressedDispatcher` and
+  move `android:windowLayoutInDisplayCutoutMode` to `values-v27`.
 
-### Fixed — export recovery
-- **`PdfCraftApplication.kt`**: expose `getRecoverableJobs()` / `clearRecoveredJob()` for
-  the recovery UI.
-- **`MainActivity.kt`**: track jobs staged this session (`pendingExports`), merge them with
-  process-death recovery, delete the staged file and `.job` metadata after a verified save,
-  and serialize destination pickers so only one is in flight at a time.
+## [0.1.0] — initial commit (`858c43c`, 2026-10-14)
 
-### Added
-- `app/src/test/java/com/domgeller/pdfcraft/ExportQueueTest.kt` — 7 Robolectric unit tests
-  covering staging, hashing, cancellation, and recovery.
-- `docs/FOLD7-TEST-REPORT.md` — build/test/lint evidence with explicit
-  PASS / PENDING / FAIL status.
-- `app/src/main/res/values-v27/themes.xml` — API 27+ theme overrides.
-- `CHANGELOG.md` — this file.
-
-### Changed
-- **`ExportQueue.kt`**: extract `validateStagingSize(Long)` so the size guard is testable
-  without allocating a multi-gigabyte array.
-- **`app/build.gradle.kts`**: use the version catalog for test dependencies, add Robolectric,
-  and add a lint block.
-
-### Verified (debug build)
-- `assembleDebug` — PASS (APK ≈ 24.8 MB)
-- `testDebugUnitTest` — PASS (7/7, 0 failures, 0 errors)
-- `lintDebug` — PASS (0 errors, 45 warnings)
-
-### Pending
-- Physical Samsung Galaxy Z Fold7 testing: start-up, open → edit → save → reopen,
-  cancellation/restart recovery, split/export, and repeated fold/unfold.
-- Release signing configuration (debug build only so far).
-
-## [0.1.0] — initial commit (2026-10-14)
-
-Initial Android wrapper: a Kotlin shell hosting the bundled PdfCraft WebAssembly web app in
-an Android `WebView`, served from `https://appassets.androidplatform.net` via
-`WebViewAssetLoader`, with a `WebMessageListener` bridge, Storage Access Framework file
-pickers, and an export staging queue.
+Initial Android wrapper hosting the bundled PdfCraft WebAssembly web app in an Android
+`WebView` via `WebViewAssetLoader`.

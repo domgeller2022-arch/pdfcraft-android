@@ -7,8 +7,8 @@
  * It does not edit generated JS/WASM, change the PDF algorithm, or modify
  * application behavior beyond capturing downloads before Blob URL revocation.
  *
- * Inject into the iframe by host.js after load — this script self-exits
- * when running on the host page (pathname starts with /assets/shell/).
+ * Injected into the iframe at document-start (via WebViewCompat.addDocumentStartJavaScript)
+ * with an iframe-load fallback in host.js. Self-exits on the host page.
  */
 (function () {
     'use strict';
@@ -26,73 +26,155 @@
     if (window.__pdfCraftDownloadAdapterInstalled) return;
     window.__pdfCraftDownloadAdapterInstalled = true;
 
-    // --- Track Blob objects created by URL.createObjectURL ---
-    // We keep references to prevent premature GC while FileReader reads asynchronously.
-    const blobMap = new Map();        // originalUrl -> Blob
-    const processedElements = new WeakSet();  // prevent duplicate processing per element
+    let blobCounter = 0;
+    const UNCLAIMED_TTL_MS = 60000; // 60s retention ceiling for unrevoked non-download blobs
+    const REVOKE_GRACE_MS = 1000;   // 1s grace window if revokeObjectURL runs before click capture
+
+    // originalUrl -> { blob: Blob, reading: boolean, revoked: boolean, ttlTimer: number }
+    const blobMap = new Map();
+    const processedClicks = new WeakSet();
     const originalCreateObjectURL = URL.createObjectURL;
     const originalRevokeObjectURL = URL.revokeObjectURL;
 
-    // Return the real Blob URL (not a fake replacement) so the upstream app's
-    // <a href> stays valid. We just track the mapping internally.
-    URL.createObjectURL = function (obj) {
-        if (obj instanceof Blob) {
-            const url = originalCreateObjectURL.call(this, obj);
-            blobMap.set(url, obj);
-            return url;
+    function isBlobLike(obj) {
+        if (!obj) return false;
+        if (obj instanceof Blob) return true;
+        const tag = Object.prototype.toString.call(obj);
+        return tag === "[object Blob]" || tag === "[object File]";
+    }
+
+    function releaseEntry(url, shouldRevokeNative) {
+        const entry = blobMap.get(url);
+        if (!entry) return;
+        if (entry.ttlTimer) clearTimeout(entry.ttlTimer);
+        blobMap.delete(url);
+        if (shouldRevokeNative) {
+            try {
+                originalRevokeObjectURL.call(URL, url);
+            } catch (_e) {
+                // Ignore revocation errors
+            }
         }
-        return originalCreateObjectURL.call(this, obj);
+    }
+
+    // Return the real Blob URL so the upstream app's <a href> stays valid.
+    URL.createObjectURL = function (obj) {
+        const url = originalCreateObjectURL.call(this, obj);
+        if (isBlobLike(obj) && typeof url === "string") {
+            const ttlTimer = setTimeout(function () {
+                const entry = blobMap.get(url);
+                if (entry && !entry.reading) {
+                    blobMap.delete(url);
+                }
+            }, UNCLAIMED_TTL_MS);
+            blobMap.set(url, {
+                blob: obj,
+                reading: false,
+                revoked: false,
+                ttlTimer: ttlTimer
+            });
+        }
+        return url;
     };
 
-    // Defer revocation until we've finished reading the Blob asynchronously.
+    // Defer native revocation if a download read is in flight, or give a brief
+    // grace window before calling originalRevokeObjectURL so non-download Blobs
+    // are properly freed in the browser engine.
     URL.revokeObjectURL = function (url) {
-        if (blobMap.has(url)) {
-            // Schedule cleanup: read is still in flight, revoke after
-            setTimeout(() => { blobMap.delete(url); }, 5000);
+        const entry = blobMap.get(url);
+        if (!entry) {
+            return originalRevokeObjectURL.call(this, url);
+        }
+        entry.revoked = true;
+        if (entry.reading) {
+            // FileReader is actively reading this Blob; onload/onerror will revoke it.
             return;
         }
-        return originalRevokeObjectURL.call(this, url);
+        setTimeout(function () {
+            const current = blobMap.get(url);
+            if (current && !current.reading) {
+                releaseEntry(url, true);
+            }
+        }, REVOKE_GRACE_MS);
     };
 
-    // --- Intercept download anchor clicks via prototype override ---
-    // The upstream web code does: create Blob URL, set anchor.href,
-    // anchor.click(), revoke URL. We intercept click() to capture the Blob.
+    function captureAnchorDownload(anchor) {
+        if (!anchor || typeof anchor.tagName !== "string") return false;
+        if (anchor.tagName.toUpperCase() !== "A") return false;
+
+        const href = anchor.getAttribute("href") || anchor.href || "";
+        if (!href || !href.startsWith("blob:") || !blobMap.has(href)) return false;
+
+        const entry = blobMap.get(href);
+        if (!entry || entry.reading) return true; // Already being captured
+
+        entry.reading = true;
+        if (entry.ttlTimer) {
+            clearTimeout(entry.ttlTimer);
+            entry.ttlTimer = null;
+        }
+
+        const filename = anchor.getAttribute("download") || anchor.download || "download.pdf";
+        const blob = entry.blob;
+        const transferId = "blob_" + Date.now() + "_" + (++blobCounter);
+
+        const reader = new FileReader();
+        reader.onload = function () {
+            const bytes = reader.result;
+            try {
+                if (window.parent && window.parent !== window) {
+                    window.parent.postMessage({
+                        type: "host:blobDownload",
+                        transferId: transferId,
+                        filename: filename,
+                        mimeType: blob.type || "application/pdf",
+                        bytes: bytes
+                    }, ASSET_ORIGIN, [bytes]);
+                }
+            } finally {
+                releaseEntry(href, true);
+            }
+        };
+        reader.onerror = function () {
+            releaseEntry(href, entry.revoked);
+        };
+        reader.readAsArrayBuffer(blob);
+        return true;
+    }
+
+    // --- Intercept programmatic anchor.click() ---
     const originalClick = HTMLElement.prototype.click;
     HTMLElement.prototype.click = function () {
-        if ((this.tagName === "A" || this.tagName === "a") && !processedElements.has(this)) {
-            const href = this.getAttribute("href");
-            if (href && href.startsWith("blob:") && blobMap.has(href)) {
-                processedElements.add(this);
-                const blob = blobMap.get(href);
-                const filename = this.getAttribute("download") || "download.pdf";
-
-                const reader = new FileReader();
-                reader.onload = function () {
-                    const bytes = reader.result;
-                    if (window.parent && window.parent.location.origin === ASSET_ORIGIN) {
-                        window.parent.postMessage({
-                            type: "host:blobDownload",
-                            transferId: "blob_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11),
-                            filename: filename,
-                            mimeType: blob.type || "application/pdf",
-                            bytes: bytes
-                        }, ASSET_ORIGIN, [bytes]);
-                    }
-                    // Release the retained Blob reference
-                    blobMap.delete(href);
-                    originalRevokeObjectURL.call(URL, href);
-                };
-                reader.onerror = function () {
-                    blobMap.delete(href);
-                };
-                reader.readAsArrayBuffer(blob);
+        if (this && !processedClicks.has(this)) {
+            if (captureAnchorDownload(this)) {
+                processedClicks.add(this);
+                // Do not invoke originalClick on captured blob: download anchors,
+                // preventing WebView's default broken blob: download navigation.
+                return;
             }
         }
         return originalClick.call(this);
     };
 
+    // --- Also intercept real DOM click events on <a href="blob:..." download> ---
+    document.addEventListener("click", function (event) {
+        const target = event.target && typeof event.target.closest === "function"
+            ? event.target.closest("a")
+            : null;
+        if (target && !processedClicks.has(target)) {
+            if (captureAnchorDownload(target)) {
+                processedClicks.add(target);
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }
+    }, true);
+
     // --- Cleanup on page unload ---
     window.addEventListener("beforeunload", function () {
+        for (const [url] of blobMap.entries()) {
+            releaseEntry(url, false);
+        }
         blobMap.clear();
     });
 })();

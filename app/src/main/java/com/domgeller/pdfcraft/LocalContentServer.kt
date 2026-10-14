@@ -3,9 +3,9 @@ package com.domgeller.pdfcraft
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import android.webkit.MimeTypeMap
 import android.webkit.WebResourceResponse
 import androidx.webkit.WebViewAssetLoader
-import java.io.File
 import java.io.IOException
 
 /**
@@ -39,8 +39,10 @@ class LocalContentServer(private val context: Context) {
         const val HOST_URL = "$ASSET_ORIGIN/assets/shell/host.html"
 
         /**
-         * MIME type map for web assets. Critical for WASM to load as
-         * application/wasm and JS as text/javascript.
+         * MIME type map for web assets and exported document types.
+         * Critical for WASM to load as application/wasm and JS as text/javascript,
+         * and for non-PDF exports (.png, .jpg, .csv, .xfdf, .txt, .json) to carry
+         * accurate MIME types into the Android document picker and Share sheet.
          */
         private val MIME_TYPES = mapOf(
             ".html" to "text/html",
@@ -53,19 +55,59 @@ class LocalContentServer(private val context: Context) {
             ".jpg" to "image/jpeg",
             ".jpeg" to "image/jpeg",
             ".gif" to "image/gif",
+            ".webp" to "image/webp",
+            ".bmp" to "image/bmp",
+            ".tif" to "image/tiff",
+            ".tiff" to "image/tiff",
             ".woff" to "font/woff",
             ".woff2" to "font/woff2",
             ".ttf" to "font/ttf",
             ".ico" to "image/x-icon",
-            ".map" to "application/json"
+            ".map" to "application/json",
+            ".pdf" to "application/pdf",
+            ".pdfa" to "application/pdf",
+            ".pdfx" to "application/pdf",
+            ".pdfua" to "application/pdf",
+            ".txt" to "text/plain",
+            ".text" to "text/plain",
+            ".csv" to "text/csv",
+            ".xfdf" to "application/vnd.adobe.xfdf",
+            ".xml" to "application/xml",
+            ".cer" to "application/x-x509-ca-cert",
+            ".crt" to "application/x-x509-ca-cert",
+            ".p12" to "application/x-pkcs12",
+            ".pfx" to "application/x-pkcs12",
+            ".rtf" to "application/rtf",
+            ".docx" to "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx" to "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx" to "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         )
 
         /**
-         * Get the MIME type for a file path based on extension.
+         * Get the MIME type for a file path or filename based on extension.
          */
         fun getMimeType(path: String): String {
             val ext = path.substringAfterLast('.', "").lowercase()
-            return MIME_TYPES[".$ext"] ?: "application/octet-stream"
+            if (ext.isEmpty()) return "application/octet-stream"
+            return MIME_TYPES[".$ext"]
+                ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                ?: "application/octet-stream"
+        }
+
+        /**
+         * Resolve the best MIME type for an exported file, preferring extension-based
+         * resolution when a generic or default application/pdf label was attached to
+         * a non-PDF filename (such as .png, .csv, .xfdf, or .txt).
+         */
+        fun resolveExportMimeType(filename: String, reportedMimeType: String?): String {
+            val byName = getMimeType(filename)
+            val cleanedReported = reportedMimeType?.trim()?.lowercase().orEmpty()
+            return when {
+                byName != "application/octet-stream" && byName != "application/pdf" -> byName
+                cleanedReported.isNotEmpty() && cleanedReported != "application/octet-stream" -> cleanedReported
+                byName != "application/octet-stream" -> byName
+                else -> "application/pdf"
+            }
         }
     }
 
@@ -89,8 +131,14 @@ class LocalContentServer(private val context: Context) {
                     val mime = getMimeType(path)
                     val encoding = if (mime.startsWith("text/") ||
                         mime == "application/json" || mime == "image/svg+xml") "UTF-8" else null
-                    WebResourceResponse(mime, encoding, 200, "OK",
-                        mapOf("Cache-Control" to "no-cache"), stream)
+                    WebResourceResponse(
+                        mime,
+                        encoding,
+                        200,
+                        "OK",
+                        mapOf("Cache-Control" to "no-cache"),
+                        stream
+                    )
                 } catch (error: IOException) {
                     Log.e(TAG, "Missing bundled asset: $path", error)
                     notFound()
@@ -112,26 +160,13 @@ class LocalContentServer(private val context: Context) {
     }
 
     private fun notFound(): WebResourceResponse = WebResourceResponse(
-        "text/plain", "UTF-8", 404, "Not Found", emptyMap(),
+        "text/plain",
+        "UTF-8",
+        404,
+        "Not Found",
+        emptyMap(),
         "Bundled resource not found".byteInputStream(Charsets.UTF_8)
     )
-
-    /**
-     * Intercept a URL and serve the local asset response.
-     * Returns a WebResourceResponse or null if the URL is not a local asset.
-     * This prevents falling through to network access for unknown paths.
-     */
-    fun shouldInterceptUrl(url: String): String? {
-        if (!url.startsWith(ASSET_ORIGIN)) return null
-        // If the URL is not under /assets/shell/ or /assets/pdfcraft/,
-        // return a local error to prevent network access.
-        if (!url.startsWith("$ASSET_ORIGIN/assets/shell/") &&
-            !url.startsWith("$ASSET_ORIGIN/assets/pdfcraft/")
-        ) {
-            return "$ASSET_ORIGIN/assets/shell/error.html"
-        }
-        return null
-    }
 
     /**
      * Check if a web build exists in the APK assets.
@@ -140,7 +175,7 @@ class LocalContentServer(private val context: Context) {
     fun hasWebBuild(): Boolean {
         return try {
             val list = context.assets.list("pdfcraft")
-            list?.isNotEmpty() ?: false
+            list != null && list.contains("index.html") && list.any { it.endsWith(".wasm") }
         } catch (e: Exception) {
             false
         }

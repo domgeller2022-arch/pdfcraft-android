@@ -5,43 +5,41 @@
  *   PdfCraft iframe → (postMessage) → host.js → (WebMessageListener.postMessage) → Android
  *   Android → (WebViewCompat.postWebMessage) → host.js → (postMessage) → PdfCraft iframe
  *
- * Protocol — all messages are JSON strings (simplest reliable path):
- *   Web → Android:  {"type":"host:ready","version":"x"}
- *                    {"type":"host:save","transferId":"t0","name":"doc.pdf","saveAs":true,"bytes":"<base64>"}
- *                    {"type":"host:dirty","dirty":true}
- *                    {"type":"host:failed","error":"msg"}
- *                    {"type":"host:saveChunk","transferId":"t0","name":"doc.pdf","saveAs":true,"totalBytes":N,"seq":i,"totalChunks":N,"data":"<base64 chunk>"}
- *                    {"type":"host:saveComplete","transferId":"t0","name":"doc.pdf","saveAs":true,"totalBytes":N}
- *                    {"type":"host:blobDownload","transferId":"blob_t0","filename":"doc.pdf","mimeType":"application/pdf","bytes":"<base64>"}
- *   Android → Web:  {"type":"host:import","name":"doc.pdf","bytes":"<base64>"}
- *                    {"type":"host:importChunk","transferId":"imp1","name":"doc.pdf","totalBytes":N,"seq":i,"totalChunks":N,"data":"<base64 chunk>"}
- *
  * Chunk size: 256 KiB — keeps individual postMessage payloads well under IPC limits.
+ * Includes independent SHA-256 sender checksums, sequence/metadata validation, bounded
+ * transfer queues, timeouts, and chunk-acknowledgement backpressure.
  */
 (function () {
     'use strict';
 
     const ASSET_ORIGIN = "https://appassets.androidplatform.net";
     const CHUNK_SIZE = 256 * 1024; // 256 KiB per plan §5
+    const MAX_IMPORT_BYTES = 100 * 1024 * 1024; // 100 MiB phone-safe import ceiling
+    const MAX_EXPORT_BYTES = 512 * 1024 * 1024; // 512 MiB staging ceiling
+    const MAX_CONCURRENT_IMPORTS = 4;
+    const MAX_QUEUED_EXPORTS = 8;
+    const TRANSFER_TIMEOUT_MS = 60000; // 60s timeout for incomplete chunked transfers
+    const CHUNK_ACK_FALLBACK_MS = 150; // Fallback timer when running in test harnesses without native acks
 
     const frame = document.getElementById("pdfcraft-frame");
     let appReady = false;
     let pendingImports = [];
-    let importChunks = new Map(); // transferId -> {name, chunks[], totalChunks}
+    let importChunks = new Map(); // transferId -> {name, chunks[], expectedSeq, receivedBytes, totalBytes, totalChunks, expectedSha256, startedAt}
+
+    // Outbound chunked export backpressure queue
+    let outboundExports = [];
+    let activeOutbound = null;
 
     // Monotonic counter for save IDs — avoids Date.now() collisions when multiple
     // saves happen in the same millisecond.
     let saveCounter = 0;
 
     // ─── Inject download-adapter.js into the iframe (fallback) ─────────
-    // When DOCUMENT_START_SCRIPT is unavailable on the device, host.js injects
-    // the adapter into the iframe after load. This covers the common case
-    // where downloads are triggered by user interaction after page load.
     function injectDownloadAdapter() {
         try {
+            if (!frame) return;
             const doc = frame.contentDocument;
-            if (!doc) return;
-            // Check if already injected
+            if (!doc || !doc.head) return;
             if (doc.querySelector('script[src="/assets/shell/download-adapter.js"]')) return;
             const script = doc.createElement('script');
             script.src = '/assets/shell/download-adapter.js';
@@ -51,32 +49,23 @@
         }
     }
 
-    // Try to inject after the iframe loads
-    frame.addEventListener('load', injectDownloadAdapter);
-    // Also retry when the iframe navigates (SPA-style)
-    frame.addEventListener('DOMContentLoaded', function() {
-        requestAnimationFrame(injectDownloadAdapter);
-    });
+    if (frame) {
+        frame.addEventListener('load', injectDownloadAdapter);
+        frame.addEventListener('DOMContentLoaded', function () {
+            requestAnimationFrame(injectDownloadAdapter);
+        });
+    }
 
     // ─── Single message listener handling BOTH iframe→host and Android→host ──
     window.addEventListener("message", function (event) {
-        if (event.origin !== ASSET_ORIGIN) return;
+        const isFromIframe = frame && event.source === frame.contentWindow;
 
-        // Android's postWebMessage delivers JSON strings, while the iframe's
-        // postMessage delivers objects. Parse strings before processing.
-        let data = event.data;
-        if (typeof data === 'string') {
-            try {
-                data = JSON.parse(data);
-            } catch (e) {
-                console.warn("Ignoring unparseable message string:", data);
-                return;
-            }
-        }
-        if (!data || typeof data.type !== "string") return;
+        if (isFromIframe) {
+            if (event.origin !== ASSET_ORIGIN) return;
 
-        // --- Messages FROM the PdfCraft iframe ---
-        if (event.source === frame.contentWindow) {
+            let data = event.data;
+            if (!data || typeof data.type !== "string") return;
+
             switch (data.type) {
                 case "pdfcraft:ready":
                     appReady = true;
@@ -97,27 +86,45 @@
                     break;
 
                 case "host:blobDownload":
-                    // Emitted by download-adapter.js running INSIDE the iframe, so it
-                    // arrives with event.source === frame.contentWindow. Handle it here
-                    // in the validated iframe branch before the early return.
                     handleBlobDownloadFromIframe(data);
                     break;
             }
             return;
         }
 
-        // --- Messages FROM the Android host (via postWebMessage as JSON string) ---
+        // --- Messages FROM the Android host (via WebViewCompat.postWebMessage) ---
+        if (event.origin !== ASSET_ORIGIN && event.origin !== "") return;
+        if (event.source !== null && event.source !== window) return;
+        if (typeof event.data !== "string") return;
+
+        let data;
+        try {
+            data = JSON.parse(event.data);
+        } catch (e) {
+            console.warn("Ignoring unparseable native message string:", event.data);
+            return;
+        }
+        if (!data || typeof data.type !== "string") return;
+
         switch (data.type) {
             case "host:import":
-                if (appReady) {
-                    sendOpenToIframe(data.name, base64ToArrayBuffer(data.bytes));
-                } else {
-                    pendingImports.push(data);
-                }
+                handleSingleImport(data);
                 break;
 
             case "host:importChunk":
-                handleImportChunk(data.transferId, data.name, data.totalBytes, data.seq, data.totalChunks, data.data);
+                handleImportChunk(
+                    data.transferId,
+                    data.name,
+                    data.totalBytes,
+                    data.seq,
+                    data.totalChunks,
+                    data.data,
+                    data.sha256
+                );
+                break;
+
+            case "host:saveChunkAck":
+                handleSaveChunkAck(data.transferId, data.seq, data.success, data.error);
                 break;
 
             case "host:saveResult":
@@ -130,7 +137,15 @@
         }
     });
 
-    // ─── Send to Android via WebMessageListener ────────────────────────
+    // Assign deferred iframe src only after message listener is registered.
+    if (frame) {
+        const deferredSrc = frame.getAttribute("data-src");
+        const currentSrc = frame.getAttribute("src");
+        if (deferredSrc && (!currentSrc || currentSrc === "")) {
+            frame.setAttribute("src", deferredSrc);
+        }
+    }
+
     function sendToNative(message) {
         if (window.WebMessageListener && typeof window.WebMessageListener.postMessage === "function") {
             window.WebMessageListener.postMessage(JSON.stringify(message));
@@ -140,153 +155,508 @@
         return false;
     }
 
-    // ─── Send pdfcraft:open to the iframe with binary bytes ─────────────
     function sendOpenToIframe(name, buffer) {
         if (!buffer) {
             console.error("host:import: invalid bytes for", name);
             return;
         }
+        if (!frame || !frame.contentWindow) {
+            console.error("host:import: iframe contentWindow unavailable");
+            return;
+        }
         frame.contentWindow.postMessage(
-            { type: "pdfcraft:open", name: name, bytes: buffer },
+            { type: "pdfcraft:open", name: name || "document.pdf", bytes: buffer },
             ASSET_ORIGIN,
             [buffer]
         );
+    }
+
+    function handleSingleImport(data) {
+        const name = (typeof data.name === "string" && data.name.length > 0) ? data.name : "document.pdf";
+        const buffer = base64ToArrayBuffer(data.bytes);
+        if (!buffer) {
+            console.error("host:import: missing or invalid base64 payload for", name);
+            return;
+        }
+        if (buffer.byteLength > MAX_IMPORT_BYTES) {
+            console.error("host:import: payload exceeds MAX_IMPORT_BYTES:", buffer.byteLength);
+            return;
+        }
+        if (typeof data.totalBytes === "number" && buffer.byteLength !== data.totalBytes) {
+            console.error("host:import: size mismatch: expected", data.totalBytes, "got", buffer.byteLength);
+            return;
+        }
+        if (typeof data.sha256 === "string" && data.sha256.length > 0) {
+            const actualHash = sha256Hex(buffer);
+            if (actualHash !== data.sha256.toLowerCase()) {
+                console.error("host:import: SHA-256 mismatch for", name);
+                return;
+            }
+        }
+        if (appReady) {
+            sendOpenToIframe(name, buffer);
+        } else {
+            pendingImports.push({ name: name, buffer: buffer });
+        }
     }
 
     function flushQueuedImports() {
         if (!appReady || pendingImports.length === 0) return;
         const queued = pendingImports.splice(0);
         for (const msg of queued) {
-            sendOpenToIframe(msg.name, base64ToArrayBuffer(msg.bytes));
+            const buffer = msg.buffer || base64ToArrayBuffer(msg.bytes);
+            sendOpenToIframe(msg.name, buffer);
         }
     }
 
-    function handleImportChunk(transferId, name, totalBytes, seq, totalChunks, base64Data) {
-        let entry = importChunks.get(transferId);
-        if (!entry) {
-            entry = { name: name, chunks: new Array(totalChunks), received: 0, totalBytes: totalBytes };
-            importChunks.set(transferId, entry);
+    function evictStaleImports(now) {
+        for (const [id, entry] of importChunks.entries()) {
+            if (now - entry.startedAt > TRANSFER_TIMEOUT_MS) {
+                console.warn("Evicting timed-out import transfer:", id);
+                importChunks.delete(id);
+            }
         }
-        if (seq < entry.chunks.length) {
-            entry.chunks[seq] = base64ToArrayBuffer(base64Data);
-            entry.received++;
-        }
-        if (entry.received >= totalChunks) {
+    }
+
+    function handleImportChunk(transferId, name, totalBytes, seq, totalChunks, base64Data, expectedSha256) {
+        const now = Date.now();
+        evictStaleImports(now);
+
+        if (typeof transferId !== "string" || transferId.length === 0) return;
+        if (!Number.isInteger(seq) || !Number.isInteger(totalChunks) || totalChunks <= 0) {
             importChunks.delete(transferId);
+            return;
+        }
+        if (seq < 0 || seq >= totalChunks) {
+            console.error("host:importChunk: out-of-range seq", seq, "of", totalChunks);
+            importChunks.delete(transferId);
+            return;
+        }
+        if (!Number.isInteger(totalBytes) || totalBytes <= 0 || totalBytes > MAX_IMPORT_BYTES) {
+            console.error("host:importChunk: invalid or oversized totalBytes:", totalBytes);
+            importChunks.delete(transferId);
+            return;
+        }
+
+        const resolvedName = (typeof name === "string" && name.length > 0) ? name : "document.pdf";
+        let entry = importChunks.get(transferId);
+
+        if (!entry) {
+            if (seq !== 0) {
+                console.error("host:importChunk: expected initial seq=0, got", seq, "for", transferId);
+                return;
+            }
+            if (importChunks.size >= MAX_CONCURRENT_IMPORTS) {
+                console.error("host:importChunk: too many concurrent imports, rejecting", transferId);
+                return;
+            }
+            entry = {
+                name: resolvedName,
+                chunks: new Array(totalChunks),
+                expectedSeq: 0,
+                receivedBytes: 0,
+                totalBytes: totalBytes,
+                totalChunks: totalChunks,
+                expectedSha256: (typeof expectedSha256 === "string" && expectedSha256.length > 0)
+                    ? expectedSha256.toLowerCase()
+                    : null,
+                startedAt: now
+            };
+            importChunks.set(transferId, entry);
+        } else {
+            // Validate strict metadata consistency and sequential ordering across chunks
+            if (entry.name !== resolvedName ||
+                entry.totalBytes !== totalBytes ||
+                entry.totalChunks !== totalChunks ||
+                (expectedSha256 && entry.expectedSha256 && entry.expectedSha256 !== expectedSha256.toLowerCase())) {
+                console.error("host:importChunk: inconsistent metadata for", transferId);
+                importChunks.delete(transferId);
+                return;
+            }
+            if (seq !== entry.expectedSeq) {
+                console.error("host:importChunk: duplicate or out-of-order seq", seq, "expected", entry.expectedSeq, "for", transferId);
+                importChunks.delete(transferId);
+                return;
+            }
+        }
+
+        const chunkBuffer = base64ToArrayBuffer(base64Data);
+        if (!chunkBuffer || chunkBuffer.byteLength === 0) {
+            console.error("host:importChunk: invalid chunk data for", transferId, "seq", seq);
+            importChunks.delete(transferId);
+            return;
+        }
+        if (entry.receivedBytes + chunkBuffer.byteLength > entry.totalBytes) {
+            console.error("host:importChunk: received bytes exceed declared totalBytes for", transferId);
+            importChunks.delete(transferId);
+            return;
+        }
+
+        entry.chunks[seq] = chunkBuffer;
+        entry.receivedBytes += chunkBuffer.byteLength;
+        entry.expectedSeq = seq + 1;
+
+        if (entry.expectedSeq === totalChunks) {
+            importChunks.delete(transferId);
+            if (entry.receivedBytes !== entry.totalBytes) {
+                console.error("host:importChunk: final byte count mismatch: expected", entry.totalBytes, "got", entry.receivedBytes);
+                return;
+            }
             const full = concatenate(entry.chunks);
-            sendOpenToIframe(entry.name, full);
+            if (full.byteLength !== entry.totalBytes) {
+                console.error("host:importChunk: concatenated size mismatch");
+                return;
+            }
+            if (entry.expectedSha256) {
+                const actualHash = sha256Hex(full);
+                if (actualHash !== entry.expectedSha256) {
+                    console.error("host:importChunk: SHA-256 mismatch: expected", entry.expectedSha256, "got", actualHash);
+                    return;
+                }
+            }
+            if (appReady) {
+                sendOpenToIframe(entry.name, full);
+            } else {
+                pendingImports.push({ name: entry.name, buffer: full });
+            }
         }
     }
 
-    // ─── Handle pdfcraft:save from the iframe ──────────────────────────
-    function generateSaveId() {
-        return "t" + Date.now() + "_" + (++saveCounter);
+    // ─── Handle pdfcraft:save and host:blobDownload from the iframe ────
+    function generateSaveId(prefix) {
+        return (prefix || "t") + Date.now() + "_" + (++saveCounter);
+    }
+
+    function inferMimeType(filename, explicitMime) {
+        if (explicitMime && explicitMime !== "application/octet-stream") {
+            const ext = (filename || "").split('.').pop().toLowerCase();
+            const byExt = mimeFromExtension(ext);
+            if (byExt && byExt !== "application/pdf" && explicitMime === "application/pdf") {
+                return byExt;
+            }
+            return explicitMime;
+        }
+        const ext = (filename || "").split('.').pop().toLowerCase();
+        return mimeFromExtension(ext) || "application/pdf";
+    }
+
+    function mimeFromExtension(ext) {
+        switch (ext) {
+            case "pdf":
+            case "pdfa":
+            case "pdfx":
+            case "pdfua":
+                return "application/pdf";
+            case "png":
+                return "image/png";
+            case "jpg":
+            case "jpeg":
+                return "image/jpeg";
+            case "gif":
+                return "image/gif";
+            case "webp":
+                return "image/webp";
+            case "svg":
+                return "image/svg+xml";
+            case "txt":
+            case "text":
+                return "text/plain";
+            case "csv":
+                return "text/csv";
+            case "json":
+                return "application/json";
+            case "xfdf":
+                return "application/vnd.adobe.xfdf";
+            case "xml":
+                return "application/xml";
+            default:
+                return null;
+        }
+    }
+
+    function transferBytesToNative(id, name, saveAs, mimeType, buffer, singleMessageType) {
+        if (buffer.byteLength > MAX_EXPORT_BYTES) {
+            console.error("Export exceeds MAX_EXPORT_BYTES:", buffer.byteLength);
+            return;
+        }
+        const senderSha256 = sha256Hex(buffer);
+
+        if (buffer.byteLength <= CHUNK_SIZE) {
+            sendToNative({
+                type: singleMessageType || "host:save",
+                transferId: id,
+                name: name,
+                filename: name,
+                saveAs: saveAs,
+                mimeType: mimeType,
+                totalBytes: buffer.byteLength,
+                sha256: senderSha256,
+                bytes: arrayBufferToBase64(buffer)
+            });
+        } else {
+            if (outboundExports.length >= MAX_QUEUED_EXPORTS) {
+                console.error("Outbound export queue full; dropping transfer:", id);
+                return;
+            }
+            const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+            outboundExports.push({
+                transferId: id,
+                name: name,
+                saveAs: saveAs,
+                mimeType: mimeType,
+                buffer: buffer,
+                totalBytes: buffer.byteLength,
+                totalChunks: totalChunks,
+                sha256: senderSha256,
+                nextSeq: 0,
+                ackTimer: null,
+                startedAt: Date.now()
+            });
+            if (!activeOutbound) {
+                pumpNextOutboundTransfer();
+            }
+        }
+    }
+
+    function pumpNextOutboundTransfer() {
+        if (activeOutbound) return;
+        activeOutbound = outboundExports.shift() || null;
+        if (!activeOutbound) return;
+        sendCurrentOutboundChunk();
+    }
+
+    function sendCurrentOutboundChunk() {
+        if (!activeOutbound) return;
+        const tx = activeOutbound;
+        if (Date.now() - tx.startedAt > TRANSFER_TIMEOUT_MS) {
+            console.error("Outbound chunked transfer timed out:", tx.transferId);
+            clearOutboundAckTimer(tx);
+            activeOutbound = null;
+            pumpNextOutboundTransfer();
+            return;
+        }
+
+        const seq = tx.nextSeq;
+        const start = seq * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, tx.totalBytes);
+        const slice = tx.buffer.slice(start, end);
+
+        sendToNative({
+            type: "host:saveChunk",
+            transferId: tx.transferId,
+            name: tx.name,
+            saveAs: tx.saveAs,
+            mimeType: tx.mimeType,
+            totalBytes: tx.totalBytes,
+            seq: seq,
+            totalChunks: tx.totalChunks,
+            chunkLength: slice.byteLength,
+            data: arrayBufferToBase64(slice)
+        });
+
+        clearOutboundAckTimer(tx);
+        // Backpressure: wait for native host:saveChunkAck, with a fallback timer so
+        // synchronous or non-acking test harnesses still progress cleanly.
+        tx.ackTimer = setTimeout(function () {
+            if (activeOutbound === tx && tx.nextSeq === seq) {
+                advanceOutboundChunk(tx.transferId, seq);
+            }
+        }, CHUNK_ACK_FALLBACK_MS);
+    }
+
+    function clearOutboundAckTimer(tx) {
+        if (tx && tx.ackTimer) {
+            clearTimeout(tx.ackTimer);
+            tx.ackTimer = null;
+        }
+    }
+
+    function handleSaveChunkAck(transferId, seq, success, error) {
+        if (!activeOutbound || activeOutbound.transferId !== transferId) return;
+        clearOutboundAckTimer(activeOutbound);
+        if (success === false) {
+            console.error("Native rejected chunk", seq, "for", transferId, error || "");
+            activeOutbound = null;
+            pumpNextOutboundTransfer();
+            return;
+        }
+        if (seq === activeOutbound.nextSeq) {
+            advanceOutboundChunk(transferId, seq);
+        }
+    }
+
+    function advanceOutboundChunk(transferId, seq) {
+        if (!activeOutbound || activeOutbound.transferId !== transferId) return;
+        const tx = activeOutbound;
+        clearOutboundAckTimer(tx);
+        tx.nextSeq = seq + 1;
+
+        if (tx.nextSeq < tx.totalChunks) {
+            sendCurrentOutboundChunk();
+        } else {
+            sendToNative({
+                type: "host:saveComplete",
+                transferId: tx.transferId,
+                name: tx.name,
+                saveAs: tx.saveAs,
+                mimeType: tx.mimeType,
+                totalBytes: tx.totalBytes,
+                totalChunks: tx.totalChunks,
+                sha256: tx.sha256
+            });
+            activeOutbound = null;
+            pumpNextOutboundTransfer();
+        }
     }
 
     function handleSaveToNative(data) {
-        const id = generateSaveId();
+        const id = generateSaveId("t");
         const name = data.name || "document.pdf";
         const saveAs = !!data.saveAs;
+        const mimeType = inferMimeType(name, data.mimeType);
         const buffer = toArrayBuffer(data.bytes);
         if (!buffer) {
             console.error("host:save: invalid bytes payload");
             return;
         }
-
-        if (buffer.byteLength <= CHUNK_SIZE) {
-            // Single message — base64-encode the bytes inline
-            sendToNative({
-                type: "host:save",
-                transferId: id,
-                name: name,
-                saveAs: saveAs,
-                bytes: arrayBufferToBase64(buffer)
-            });
-        } else {
-            // Chunked transfer
-            const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
-            for (let i = 0; i < totalChunks; i++) {
-                const start = i * CHUNK_SIZE;
-                const end = Math.min(start + CHUNK_SIZE, buffer.byteLength);
-                sendToNative({
-                    type: "host:saveChunk",
-                    transferId: id,
-                    name: name,
-                    saveAs: saveAs,
-                    totalBytes: buffer.byteLength,
-                    seq: i,
-                    totalChunks: totalChunks,
-                    data: arrayBufferToBase64(buffer.slice(start, end))
-                });
-            }
-            sendToNative({
-                type: "host:saveComplete",
-                transferId: id,
-                name: name,
-                saveAs: saveAs,
-                totalBytes: buffer.byteLength
-            });
-        }
+        transferBytesToNative(id, name, saveAs, mimeType, buffer, "host:save");
     }
 
-    // ─── Handle host:blobDownload emitted by download-adapter.js (iframe) ──
     function handleBlobDownloadFromIframe(data) {
         const buffer = toArrayBuffer(data.bytes);
         if (!buffer) {
             console.error("host:blobDownload: invalid bytes payload");
             return;
         }
-        sendToNative({
-            type: "host:blobDownload",
-            transferId: data.transferId || ("blob_" + Date.now()),
-            filename: data.filename || data.name || "download.pdf",
-            mimeType: data.mimeType || "application/pdf",
-            bytes: arrayBufferToBase64(buffer)
-        });
+        const id = data.transferId || generateSaveId("blob_");
+        const name = data.filename || data.name || "download.pdf";
+        const mimeType = inferMimeType(name, data.mimeType);
+        transferBytesToNative(id, name, true, mimeType, buffer, "host:blobDownload");
     }
 
     // ─── Utilities ────────────────────────────────────────────────────────
-    // Realm-agnostic type checks: messages cross the iframe↔parent boundary and
-    // `instanceof` is unreliable across realms. Object.prototype.toString and
-    // ArrayBuffer.isView behave consistently regardless of the source realm.
     function toArrayBuffer(input) {
         if (!input) return null;
         if (Object.prototype.toString.call(input) === "[object ArrayBuffer]") return input;
-        if (ArrayBuffer.isView(input)) return input.buffer;
+        if (ArrayBuffer.isView(input)) {
+            if (input.byteOffset === 0 && input.byteLength === input.buffer.byteLength) {
+                return input.buffer;
+            }
+            return input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
+        }
         return null;
     }
 
     function base64ToArrayBuffer(b64) {
-        const binary = atob(b64);
-        const len = binary.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-        return bytes.buffer;
+        if (typeof b64 !== "string" || b64.length === 0) return null;
+        try {
+            const binary = atob(b64);
+            const len = binary.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes.buffer;
+        } catch (_e) {
+            return null;
+        }
     }
 
     function arrayBufferToBase64(buf) {
-        let binary = "";
         const bytes = new Uint8Array(buf);
         const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
-        return btoa(binary);
+        const STEP = 0x8000;
+        const parts = [];
+        for (let i = 0; i < len; i += STEP) {
+            const sub = bytes.subarray(i, Math.min(i + STEP, len));
+            parts.push(String.fromCharCode.apply(null, sub));
+        }
+        return btoa(parts.join(""));
     }
 
     function concatenate(chunks) {
-        const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+        const total = chunks.reduce((s, c) => s + (c ? c.byteLength : 0), 0);
         const result = new Uint8Array(total);
         let off = 0;
-        for (const c of chunks) { result.set(new Uint8Array(c), off); off += c.byteLength; }
+        for (const c of chunks) {
+            if (!c) continue;
+            result.set(new Uint8Array(c), off);
+            off += c.byteLength;
+        }
         return result.buffer;
     }
 
-    // Expose for download-adapter.js
+    // Synchronous FIPS 180-4 SHA-256 implementation over an ArrayBuffer
+    const SHA256_K = new Uint32Array([
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]);
+
+    function sha256Hex(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const bitLenHi = Math.floor((bytes.length * 8) / 0x100000000);
+        const bitLenLo = (bytes.length * 8) >>> 0;
+        const padLen = ((bytes.length + 9 + 63) & ~63);
+        const padded = new Uint8Array(padLen);
+        padded.set(bytes);
+        padded[bytes.length] = 0x80;
+        const view = new DataView(padded.buffer);
+        view.setUint32(padLen - 8, bitLenHi, false);
+        view.setUint32(padLen - 4, bitLenLo, false);
+
+        let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+        let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+        const w = new Uint32Array(64);
+
+        for (let off = 0; off < padLen; off += 64) {
+            for (let i = 0; i < 16; i++) {
+                w[i] = view.getUint32(off + i * 4, false);
+            }
+            for (let i = 16; i < 64; i++) {
+                const v1 = w[i - 15];
+                const s0 = ((v1 >>> 7) | (v1 << 25)) ^ ((v1 >>> 18) | (v1 << 14)) ^ (v1 >>> 3);
+                const v2 = w[i - 2];
+                const s1 = ((v2 >>> 17) | (v2 << 15)) ^ ((v2 >>> 19) | (v2 << 13)) ^ (v2 >>> 10);
+                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+            }
+
+            let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+            for (let i = 0; i < 64; i++) {
+                const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+                const ch = (e & f) ^ (~e & g);
+                const temp1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+                const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+                const maj = (a & b) ^ (a & c) ^ (b & c);
+                const temp2 = (S0 + maj) >>> 0;
+
+                h = g; g = f; f = e;
+                e = (d + temp1) >>> 0;
+                d = c; c = b; b = a;
+                a = (temp1 + temp2) >>> 0;
+            }
+
+            h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+            h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+        }
+
+        return [h0, h1, h2, h3, h4, h5, h6, h7]
+            .map(v => v.toString(16).padStart(8, "0"))
+            .join("");
+    }
+
     window.PdfCraftHost = {
         ASSET_ORIGIN: ASSET_ORIGIN,
         sendToNative: sendToNative,
         handleSave: handleSaveToNative,
+        handleBlobDownload: handleBlobDownloadFromIframe,
         sendOpenToIframe: sendOpenToIframe,
         flushQueuedImports: flushQueuedImports,
-        generateSaveId: generateSaveId
+        generateSaveId: generateSaveId,
+        toArrayBuffer: toArrayBuffer,
+        sha256Hex: sha256Hex
     };
 })();

@@ -24,10 +24,11 @@
     </style>
 </head>
 <body>
+    <!-- data-src is assigned to src by host.js AFTER message listeners are registered -->
     <iframe
         id="pdfcraft-frame"
         title="PdfCraft"
-        src="../pdfcraft/index.html?host=parent"
+        data-src="../pdfcraft/index.html?host=parent"
         allow="fullscreen; clipboard-read; clipboard-write"
         allowfullscreen>
     </iframe>

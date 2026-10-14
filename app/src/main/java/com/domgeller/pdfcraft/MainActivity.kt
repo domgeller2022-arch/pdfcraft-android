@@ -1,56 +1,50 @@
 package com.domgeller.pdfcraft
 
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import android.view.WindowInsetsController
+import android.view.Gravity
 import android.view.WindowManager
-import android.webkit.WebResourceRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.getSystemService
+import androidx.appcompat.app.AlertDialog
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.webkit.WebViewCompat
-import androidx.webkit.WebViewFeature
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
-import java.io.File
-import java.util.concurrent.Executors
+import com.google.android.material.button.MaterialButton
 
 /**
  * MainActivity — hosts the PdfCraft web app inside an Android WebView.
- *
- * Uses WebViewAssetLoader to serve bundled WASM/JS/HTML assets over a local
- * HTTPS origin (https://appassets.androidplatform.net), preserving the
- * same-origin ?host=parent bridge used by the upstream app.
- *
- * Key responsibilities (per plan §3–§10):
- * - Full-size WebView with hardware acceleration
- * - WebViewAssetLoader for local HTTPS serving
- * - WebMessageListener for host ↔ Android messaging
- * - PdfCraftChromeClient for original file picker integration
- * - Configuration changes (fold/unfold, rotation) preserving the WebView instance
- * - Back button: dismiss keyboard → exit prompt for unsaved work
- * - Intent handling (ACTION_VIEW PDF, ACTION_SEND)
- * - onRenderProcessGone handling
  */
 class MainActivity : ComponentActivity() {
 
     companion object {
         const val TAG = "MainActivity"
+        private const val STARTUP_READY_TIMEOUT_MS = 25_000L
+        private const val STATE_ACTIVE_PICKER_JOB_ID = "state_active_picker_job_id"
+        private const val STATE_QUEUED_PICKER_JOB_IDS = "state_queued_picker_job_ids"
+        private const val STATE_STARTUP_PROMPT_SHOWN = "state_startup_prompt_shown"
     }
 
     private lateinit var webView: WebView
@@ -59,68 +53,75 @@ class MainActivity : ComponentActivity() {
     private var chromeClient: PdfCraftChromeClient? = null
     private var messageBridge: HostMessageBridge? = null
 
-    private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Pending import from intent (queued until pdfcraft:ready)
     private val pendingIntentImports = mutableListOf<PendingImport>()
     private var appReady = false
     private var appDirty = false
+    private var errorSurfaceShowing = false
+    private var startupRecoveryPromptShown = false
 
-    // Current export job awaiting destination selection
-    private var currentExportJob: ExportQueue.ExportJob? = null
-
-    // Jobs staged this session that still need a destination. Kept across
-    // cancellation so the back-press recovery dialog can offer a retry.
-    private val pendingExports = LinkedHashMap<String, ExportQueue.ExportJob>()
-
-    // Serializes destination pickers: only one may be in flight at a time.
-    private val pickerQueue = ArrayDeque<ExportQueue.ExportJob>()
+    private val startupTimeoutRunnable = Runnable {
+        if (!appReady && !errorSurfaceShowing && !isFinishing && !isDestroyed) {
+            Log.e(TAG, "Timed out waiting for pdfcraft:ready from WASM application")
+            showErrorSurface(
+                "PdfCraft took too long to initialize. Check that Android System WebView is up to date and retry.",
+                canRetry = true
+            )
+        }
+    }
 
     data class PendingImport(val name: String, val bytes: ByteArray)
 
-    // ActivityResultLauncher for save destination picker
+    // ActivityResultLauncher for save destination picker.
+    // Resolves the active ExportJob from the durable ExportQueue so Activity recreation
+    // or process death while DocumentsUI is open never orphans the returned URI.
     private val saveDestinationLauncher: ActivityResultLauncher<Intent> =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val job = currentExportJob
-            currentExportJob = null
-            if (job == null) {
-                advancePickerQueue()
-                return@registerForActivityResult
-            }
-
-            if (result.resultCode == RESULT_OK) {
-                val destUri = result.data?.data
-                if (destUri != null) {
-                    handleSaveDestinationSelected(destUri, job)
+            val app = application as PdfCraftApplication
+            val (job, nextJob) = app.exportQueue.consumeCurrentAndAdvancePicker()
+            if (job != null) {
+                if (result.resultCode == RESULT_OK) {
+                    val destUri = result.data?.data
+                    if (destUri != null) {
+                        handleSaveDestinationSelected(destUri, job)
+                    } else {
+                        handleSaveCancelled(job)
+                    }
                 } else {
                     handleSaveCancelled(job)
                 }
             } else {
-                handleSaveCancelled(job)
+                Log.w(TAG, "Destination picker returned with no active ExportJob in queue")
             }
-            advancePickerQueue()
+
+            if (nextJob != null) {
+                showSaveDestinationPicker(nextJob)
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Enable edge-to-edge for Android 16 large-display behavior
+        val app = application as PdfCraftApplication
+        if (savedInstanceState != null) {
+            startupRecoveryPromptShown = savedInstanceState.getBoolean(STATE_STARTUP_PROMPT_SHOWN, false)
+            val savedActiveId = savedInstanceState.getString(STATE_ACTIVE_PICKER_JOB_ID)
+            val savedQueuedIds = savedInstanceState.getStringArrayList(STATE_QUEUED_PICKER_JOB_IDS).orEmpty()
+            app.exportQueue.restorePickerSelection(savedActiveId, savedQueuedIds)
+        }
+
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
 
-        // Hardware acceleration is required for WebGL/Glow renderer
-        window.addFlags(
-            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
-        )
-
-        // Create the WebView
         webView = WebView(this)
         val layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
         setContentView(webView, layoutParams)
+        setupWindowInsetsListener()
 
-        // Configure WebView settings
         val settings: WebSettings = webView.settings
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
@@ -132,70 +133,90 @@ class MainActivity : ComponentActivity() {
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         settings.displayZoomControls = false
-        settings.builtInZoomControls = false // Let eframe handle its own zoom
+        settings.builtInZoomControls = false
         settings.textZoom = 100
 
-        // Enable WebView debugging only for debug builds
         if (BuildConfig.DEBUG) {
             WebView.setWebContentsDebuggingEnabled(true)
         }
 
-        // Set up WebViewAssetLoader for local HTTPS serving
         localContentServer = LocalContentServer(this)
         assetLoader = localContentServer.createAssetLoader()
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
-                view: WebView, request: WebResourceRequest
+                view: WebView,
+                request: WebResourceRequest
             ): WebResourceResponse? = localContentServer.interceptRequest(assetLoader, request.url)
 
             override fun onReceivedError(
-                view: WebView, request: WebResourceRequest, error: WebResourceError
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError
             ) {
                 if (request.isForMainFrame) {
+                    mainHandler.removeCallbacks(startupTimeoutRunnable)
                     showErrorSurface("Unable to load bundled PdfCraft: ${error.description}", true)
                 }
             }
 
             override fun onReceivedHttpError(
-                view: WebView, request: WebResourceRequest, response: WebResourceResponse
+                view: WebView,
+                request: WebResourceRequest,
+                response: WebResourceResponse
             ) {
                 if (request.isForMainFrame) {
+                    mainHandler.removeCallbacks(startupTimeoutRunnable)
                     showErrorSurface("Bundled PdfCraft resource failed (${response.statusCode}).", true)
                 }
             }
 
             override fun shouldOverrideUrlLoading(
-                view: WebView, url: String
-            ): Boolean = false
+                view: WebView,
+                request: WebResourceRequest
+            ): Boolean {
+                val url = request.url
+                return !url.toString().startsWith(LocalContentServer.ASSET_ORIGIN)
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: RenderProcessGoneDetail
+            ): Boolean {
+                Log.e(
+                    TAG,
+                    "WebView renderer exited (didCrash=${detail.didCrash()}, priority=${detail.rendererPriorityAtExit()})"
+                )
+                mainHandler.removeCallbacks(startupTimeoutRunnable)
+                appReady = false
+                runCatching {
+                    (view.parent as? FrameLayout)?.removeView(view)
+                    view.destroy()
+                }
+                showErrorSurface(getString(R.string.error_webview), canRetry = true)
+                return true
+            }
         }
 
-        // Verify the web build exists in assets
         if (!localContentServer.hasWebBuild()) {
             Log.e(TAG, "Web build not found in APK assets at assets/pdfcraft/")
             showErrorSurface("PdfCraft web build not found in APK. Build may need to be rebuilt.", true)
             return
         }
 
-        // Set up WebChromeClient for file picker (plan §6)
-        chromeClient = PdfCraftChromeClient(this) { uris, graceful ->
-            // The PdfCraftChromeClient handles the callback internally
-            // This lambda is for future expansion (e.g., logging)
-        }
+        chromeClient = PdfCraftChromeClient(this) { _, _ -> }
         webView.webChromeClient = chromeClient
 
-        // Register the WebMessageListener for host ↔ Android communication (plan §5)
-        val app = application as PdfCraftApplication
         messageBridge = HostMessageBridge(
             webView = webView,
             assetOrigin = LocalContentServer.ASSET_ORIGIN,
             bridgeObjectName = "WebMessageListener",
             stagingDir = app.stagingDir,
             metadataDir = app.metadataDir,
-            executor = ioExecutor,
+            exportQueue = app.exportQueue,
+            executor = app.ioExecutor,
             callback = object : HostMessageBridge.BridgeCallback {
                 override fun onSaveStaged(transferId: String, job: ExportQueue.ExportJob) {
                     runOnUiThread {
-                        pendingExports[job.transferId] = job
                         requestSaveDestination(job)
                     }
                 }
@@ -204,8 +225,21 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread {
                         if (success) {
                             Toast.makeText(this@MainActivity, "Saved", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(this@MainActivity, "Save failed: $error", Toast.LENGTH_LONG).show()
+                        } else if (!isFinishing && !isDestroyed) {
+                            val existingJob = app.exportQueue.getJob(transferId)
+                            if (existingJob != null) {
+                                showExportActionDialog(
+                                    existingJob,
+                                    title = "Export error",
+                                    message = "Export ($transferId) encountered an error: ${error ?: "unknown error"}."
+                                )
+                            } else {
+                                AlertDialog.Builder(this@MainActivity)
+                                    .setTitle("Export failed")
+                                    .setMessage("Could not stage export ($transferId): ${error ?: "unknown error"}. Please try saving again.")
+                                    .setPositiveButton("OK", null)
+                                    .show()
+                            }
                         }
                     }
                 }
@@ -213,38 +247,61 @@ class MainActivity : ComponentActivity() {
                 override fun onImportRequested() {}
 
                 override fun onAppReady(version: String) {
-                    appReady = true
-                    Log.i(TAG, "PdfCraft app ready, version: $version")
-                    if (pendingIntentImports.isNotEmpty()) {
-                        val imports = pendingIntentImports.toList()
-                        pendingIntentImports.clear()
-                        for (import in imports) {
-                            sendImportToIframe(import.name, import.bytes)
+                    runOnUiThread {
+                        mainHandler.removeCallbacks(startupTimeoutRunnable)
+                        appReady = true
+                        Log.i(TAG, "PdfCraft app ready, version: $version")
+                        if (pendingIntentImports.isNotEmpty()) {
+                            val imports = pendingIntentImports.toList()
+                            pendingIntentImports.clear()
+                            for (import in imports) {
+                                sendImportToIframe(import.name, import.bytes)
+                            }
                         }
+                        maybePromptRecoveredExportsAtStartup()
                     }
                 }
 
-                override fun onDirtyChanged(dirty: Boolean) { appDirty = dirty }
+                override fun onDirtyChanged(dirty: Boolean) {
+                    runOnUiThread {
+                        appDirty = dirty
+                    }
+                }
 
                 override fun onAppFailed(error: String) {
-                    runOnUiThread { showErrorSurface("PdfCraft failed: $error", true) }
+                    runOnUiThread {
+                        mainHandler.removeCallbacks(startupTimeoutRunnable)
+                        showErrorSurface("PdfCraft failed: $error", true)
+                    }
                 }
             }
         )
         messageBridge?.register()
 
-        // Set up back button handling with AndroidX OnBackPressedDispatcher
         setupBackHandling()
 
-        // Load the host page via the asset loader
+        mainHandler.postDelayed(startupTimeoutRunnable, STARTUP_READY_TIMEOUT_MS)
         webView.loadUrl(LocalContentServer.HOST_URL)
 
-        // Handle incoming intent (if launched with a PDF)
-        handleIntent(intent)
+        if (savedInstanceState == null) {
+            handleIntent(intent)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        val app = application as PdfCraftApplication
+        outState.putBoolean(STATE_STARTUP_PROMPT_SHOWN, startupRecoveryPromptShown)
+        outState.putString(STATE_ACTIVE_PICKER_JOB_ID, app.exportQueue.getActivePickerJob()?.transferId)
+        outState.putStringArrayList(
+            STATE_QUEUED_PICKER_JOB_IDS,
+            ArrayList(app.exportQueue.getQueuedPickerIds())
+        )
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleIntent(intent)
     }
 
@@ -254,8 +311,11 @@ class MainActivity : ComponentActivity() {
         when (intent.action) {
             Intent.ACTION_VIEW -> {
                 val uri = intent.data
-                if (uri != null && isPdfUri(uri)) {
-                    importFromUri(uri, "document.pdf")
+                if (uri != null && isSupportedImportUri(uri, intent.type)) {
+                    val fallbackName = uri.lastPathSegment?.substringAfterLast('/') ?: "document.pdf"
+                    importFromUri(uri, fallbackName)
+                } else if (uri != null) {
+                    Toast.makeText(this, "Unsupported file URI or format", Toast.LENGTH_SHORT).show()
                 }
             }
             Intent.ACTION_SEND -> {
@@ -264,8 +324,9 @@ class MainActivity : ComponentActivity() {
                 } else {
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(Intent.EXTRA_STREAM)
-                }
-                if (uri != null && uri.scheme == "content") {
+                } ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+
+                if (uri != null && isSupportedImportUri(uri, intent.type)) {
                     val name = intent.getStringExtra(Intent.EXTRA_TITLE) ?: "document.pdf"
                     importFromUri(uri, name)
                 }
@@ -278,7 +339,7 @@ class MainActivity : ComponentActivity() {
                     intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
                 }
                 uris?.forEachIndexed { index, uri ->
-                    if (uri != null && uri.scheme == "content") {
+                    if (uri != null && isSupportedImportUri(uri, intent.type)) {
                         val name = uri.lastPathSegment?.substringAfterLast('/') ?: "document_$index.pdf"
                         importFromUri(uri, name)
                     }
@@ -287,17 +348,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun isPdfUri(uri: Uri): Boolean {
-        val type = contentResolver.getType(uri)
-        return type == "application/pdf"
+    private fun isSupportedImportUri(uri: Uri, intentMimeType: String?): Boolean {
+        if (uri.scheme != "content" && uri.scheme != "file") return false
+        val resolverType = contentResolver.getType(uri)?.lowercase()
+        val declaredType = intentMimeType?.lowercase()
+        val displayName = runCatching { DocumentIo.getDisplayName(this, uri) }.getOrNull().orEmpty().lowercase()
+        return resolverType == "application/pdf" ||
+            declaredType == "application/pdf" ||
+            displayName.endsWith(".pdf")
     }
 
-    private fun importFromUri(uri: Uri, name: String) {
-        ioExecutor.execute {
+    private fun importFromUri(uri: Uri, fallbackName: String) {
+        val app = application as PdfCraftApplication
+        val appContext = applicationContext
+        app.ioExecutor.execute {
             try {
-                val bytes = DocumentIo.readBytes(this, uri)
-                val displayName = DocumentIo.getDisplayName(this, uri) ?: name
+                val bytes = DocumentIo.readBytes(appContext, uri)
+                val displayName = DocumentIo.getDisplayName(appContext, uri).ifBlank { fallbackName }
                 runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
                     if (appReady) {
                         sendImportToIframe(displayName, bytes)
                     } else {
@@ -307,96 +376,154 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to import PDF: ${e.message}", e)
                 runOnUiThread {
-                    Toast.makeText(this, "Failed to open file: ${e.message}", Toast.LENGTH_LONG).show()
+                    if (!isFinishing && !isDestroyed) {
+                        AlertDialog.Builder(this)
+                            .setTitle("Unable to open PDF")
+                            .setMessage("Could not read the selected file: ${e.message}")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
                 }
             }
         }
     }
 
     private fun sendImportToIframe(name: String, bytes: ByteArray) {
-        // Send the import request to the host page, which forwards it to the iframe
         messageBridge?.sendImport(name, bytes)
     }
 
-    /**
-     * Serialize destination pickers: if one is already showing, queue this job
-     * until the current picker returns.
-     */
-    private fun requestSaveDestination(job: ExportQueue.ExportJob) {
-        if (currentExportJob != null) {
-            pickerQueue.addLast(job)
-            return
-        }
-        currentExportJob = job
-        showSaveDestinationPicker(job)
-    }
-
-    private fun advancePickerQueue() {
-        val next = pickerQueue.removeFirstOrNull() ?: return
-        currentExportJob = next
-        showSaveDestinationPicker(next)
-    }
-
-    /**
-     * Remove an export from pending/recovery tracking and delete its staged file
-     * plus metadata. Used after a verified save or an explicit discard.
-     */
-    private fun removeStagedExport(job: ExportQueue.ExportJob) {
-        pendingExports.remove(job.transferId)
+    private fun getAllPendingExports(): Map<String, ExportQueue.ExportJob> {
         val app = application as PdfCraftApplication
-        app.clearRecoveredJob(job.transferId)
-        try { job.stageFile.delete() } catch (_: Exception) {}
-        try { File(app.metadataDir, "${job.transferId}.job").delete() } catch (_: Exception) {}
+        return app.exportQueue.getAllPendingJobs()
+    }
+
+    private fun maybePromptRecoveredExportsAtStartup() {
+        if (startupRecoveryPromptShown) return
+        val app = application as PdfCraftApplication
+        val recovered = app.getRecoverableJobs()
+        if (recovered.isNotEmpty() && app.exportQueue.getActivePickerJob() == null) {
+            startupRecoveryPromptShown = true
+            showPendingExportsDialog(getAllPendingExports(), isExitFlow = false)
+        }
+    }
+
+    private fun requestSaveDestination(job: ExportQueue.ExportJob) {
+        val app = application as PdfCraftApplication
+        if (app.exportQueue.acquireOrEnqueuePicker(job)) {
+            showSaveDestinationPicker(job)
+        }
+    }
+
+    private fun removeStagedExport(job: ExportQueue.ExportJob) {
+        val app = application as PdfCraftApplication
+        app.exportQueue.completeAndRemoveJob(job.transferId)
     }
 
     private fun showSaveDestinationPicker(job: ExportQueue.ExportJob) {
-        val safeName = job.name.replace("[^\\w\\-. ]".toRegex(), "_").ifEmpty { "document.pdf" }
+        val safeName = job.name.replace("[^\\w\\-. ()]".toRegex(), "_").ifEmpty { "document.pdf" }
+        val resolvedMime = LocalContentServer.resolveExportMimeType(safeName, job.mimeType)
 
         val createFileIntent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/pdf"
+            type = resolvedMime
             putExtra(Intent.EXTRA_TITLE, safeName)
         }
 
-        saveDestinationLauncher.launch(createFileIntent)
+        try {
+            saveDestinationLauncher.launch(createFileIntent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to launch destination picker: ${e.message}", e)
+            val app = application as PdfCraftApplication
+            val (_, nextJob) = app.exportQueue.consumeCurrentAndAdvancePicker()
+            handleSaveCancelled(job)
+            if (nextJob != null) {
+                showSaveDestinationPicker(nextJob)
+            }
+        }
     }
 
     private fun handleSaveDestinationSelected(destUri: Uri, job: ExportQueue.ExportJob) {
-        ioExecutor.execute {
+        val app = application as PdfCraftApplication
+        val appContext = applicationContext
+        app.ioExecutor.execute {
             try {
-                DocumentIo.takeReadWritePermission(this, destUri)
-                // Copy from staging to the chosen URI
-                val stagedBytes = DocumentIo.readFromFile(job.stageFile)
-                DocumentIo.writeToUri(this, destUri, stagedBytes)
+                DocumentIo.takeReadWritePermission(appContext, destUri)
+                DocumentIo.copyFileToUri(appContext, job.stageFile, destUri)
 
-                // Verify the written file (if provider permits re-reading)
-                val verified = DocumentIo.verifyWrittenDocument(this, destUri, job.stagedHash, job.totalBytes)
+                val verification = DocumentIo.verifyWrittenDocumentDetailed(
+                    appContext,
+                    destUri,
+                    job.stagedHash,
+                    job.totalBytes
+                )
 
                 runOnUiThread {
-                    if (verified) {
-                        Log.i(TAG, "Export verified: ${job.transferId}")
-                        removeStagedExport(job)
-                        messageBridge?.sendToHost(
-                            """{"type":"host:saveResult","transferId":"${job.transferId}","success":true}"""
-                        )
-                        Toast.makeText(this, "Saved: ${job.name}", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Log.w(TAG, "Export verification failed for ${job.transferId}")
-                        Toast.makeText(
-                            this,
-                            "Warning: saved file may be incomplete",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        messageBridge?.sendToHost(
-                            """{"type":"host:saveResult","transferId":"${job.transferId}","success":false,"error":"verification failed"}"""
-                        )
+                    when (verification.outcome) {
+                        DocumentIo.VerificationOutcome.VERIFIED -> {
+                            Log.i(TAG, "Export independently verified: ${job.transferId}")
+                            removeStagedExport(job)
+                            messageBridge?.sendSaveResult(job.transferId, true)
+                            if (!isFinishing && !isDestroyed) {
+                                Toast.makeText(
+                                    this,
+                                    "Saved & verified: ${job.name}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+
+                        DocumentIo.VerificationOutcome.UNAVAILABLE -> {
+                            // Provider accepted and flushed all bytes, but does not allow re-reading.
+                            Log.i(
+                                TAG,
+                                "Provider accepted write for ${job.transferId}; read-back verification unavailable: ${verification.detail}"
+                            )
+                            messageBridge?.sendSaveResult(job.transferId, true)
+                            if (!isFinishing && !isDestroyed) {
+                                AlertDialog.Builder(this)
+                                    .setTitle("Saved to storage provider")
+                                    .setMessage(
+                                        "\"${job.name}\" (${job.totalBytes} bytes) was written to the selected destination, " +
+                                            "but this storage provider does not support reading back the file for independent checksum verification.\n\n" +
+                                            "Would you like to mark this export complete or keep the private staged copy as a backup?"
+                                    )
+                                    .setPositiveButton("Mark complete") { _, _ ->
+                                        removeStagedExport(job)
+                                    }
+                                    .setNeutralButton("Keep backup") { _, _ ->
+                                        app.exportQueue.cancelJob(job.transferId)
+                                    }
+                                    .setNegativeButton("Share copy…") { _, _ ->
+                                        shareStagedExport(job)
+                                    }
+                                    .show()
+                            }
+                        }
+
+                        DocumentIo.VerificationOutcome.MISMATCH -> {
+                            Log.w(
+                                TAG,
+                                "Export verification mismatch for ${job.transferId}: ${verification.detail}"
+                            )
+                            app.exportQueue.failJob(job.transferId)
+                            messageBridge?.sendSaveResult(job.transferId, false, "verification mismatch")
+                            showExportActionDialog(
+                                job,
+                                title = "Save verification failed",
+                                message = "The destination file did not match the expected checksum or length for \"${job.name}\" (${verification.detail}). Your private staged copy is safely preserved."
+                            )
+                        }
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to write export: ${e.message}", e)
+                app.exportQueue.failJob(job.transferId)
                 runOnUiThread {
-                    messageBridge?.sendToHost(
-                        """{"type":"host:saveResult","transferId":"${job.transferId}","success":false,"error":"${e.message}"}"""
+                    messageBridge?.sendSaveResult(job.transferId, false, e.message ?: "write failed")
+                    showExportActionDialog(
+                        job,
+                        title = "Save failed",
+                        message = "Could not write \"${job.name}\" (${e.message}). Your staged copy is preserved so you can retry or share it."
                     )
                 }
             }
@@ -404,68 +531,127 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleSaveCancelled(job: ExportQueue.ExportJob) {
-        // Keep the staged bytes and track the job so the back-press recovery
-        // dialog can offer a retry.
-        pendingExports[job.transferId] = job
+        val app = application as PdfCraftApplication
+        app.exportQueue.cancelJob(job.transferId)
         Log.i(TAG, "Save cancelled for ${job.transferId}, keeping staged file")
-        Toast.makeText(
-            this,
-            "Save cancelled. Export remains pending for retry.",
-            Toast.LENGTH_LONG
-        ).show()
+        showExportActionDialog(
+            job,
+            title = "Export still pending",
+            message = "\"${job.name}\" was not saved to a folder yet. You can choose a destination now, share it to another app, or keep it pending."
+        )
     }
 
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+    private fun showExportActionDialog(
+        job: ExportQueue.ExportJob,
+        title: String,
+        message: String
+    ) {
+        if (isFinishing || isDestroyed) return
+        val options = arrayOf(
+            "Save to device…",
+            "Share via Android…",
+            "Keep pending for later",
+            "Discard this export"
+        )
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> requestSaveDestination(job)
+                    1 -> shareStagedExport(job)
+                    2 -> Toast.makeText(
+                        this,
+                        "Kept \"${job.name}\" in pending exports",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    3 -> {
+                        removeStagedExport(job)
+                        Toast.makeText(this, "Discarded \"${job.name}\"", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun shareStagedExport(job: ExportQueue.ExportJob) {
+        if (!job.stageFile.exists()) {
+            Toast.makeText(this, "Staged file is no longer available", Toast.LENGTH_SHORT).show()
+            removeStagedExport(job)
+            return
+        }
+        try {
+            val authority = "${applicationContext.packageName}.fileprovider"
+            val contentUri = FileProvider.getUriForFile(this, authority, job.stageFile)
+            val resolvedMime = LocalContentServer.resolveExportMimeType(job.name, job.mimeType)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = resolvedMime
+                putExtra(Intent.EXTRA_STREAM, contentUri)
+                putExtra(Intent.EXTRA_TITLE, job.name)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(shareIntent, "Share ${job.name}"))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to share staged export: ${e.message}", e)
+            Toast.makeText(this, "Unable to share file: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        Log.d(TAG, "Config changed: orientation=${newConfig.orientation}, screenSize=${newConfig.screenWidthDp}x${newConfig.screenHeightDp}")
-        // Do NOT recreate the WebView or reload the page.
-        // The live WASM session, tabs, and editing state are preserved.
-        // The iframe will receive a resize event and eframe will handle canvas resizing.
-        applyWindowInsets()
+        Log.d(
+            TAG,
+            "Config changed: orientation=${newConfig.orientation}, screenSize=${newConfig.screenWidthDp}x${newConfig.screenHeightDp}"
+        )
+        updateStatusBarAppearance(newConfig)
+        ViewCompat.requestApplyInsets(webView)
     }
 
     override fun onPause() {
         super.onPause()
         webView.onPause()
-        webView.pauseTimers()
     }
 
     override fun onResume() {
         super.onResume()
         webView.onResume()
         webView.resumeTimers()
-        applyWindowInsets()
+        updateStatusBarAppearance(resources.configuration)
+        ViewCompat.requestApplyInsets(webView)
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        mainHandler.removeCallbacks(startupTimeoutRunnable)
         messageBridge?.unregister()
         chromeClient?.cleanup()
-        webView.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
-        webView.stopLoading()
-        webView.destroy()
+        runCatching {
+            webView.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
+            webView.stopLoading()
+            webView.destroy()
+        }
+        // Note: app.ioExecutor is owned by PdfCraftApplication and intentionally NOT shut down
+        // on Activity destruction so in-flight staging/writes complete across Activity recreation.
+        super.onDestroy()
     }
 
-    /**
-     * Back button handling (plan §10):
-     * Uses AndroidX OnBackPressedDispatcher for Android 16+ predictive back gesture support.
-     * 1. Dismiss keyboard/IME if open
-     * 2. Exit fullscreen if in fullscreen mode
-     * 3. If dirty/volatile transfers/pending exports: show Stay/Discard/Cancel
-     */
     private fun setupBackHandling() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                val hasInFlight = messageBridge?.hasInFlightTransfers() == true
+                if (hasInFlight) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "An export transfer is currently finishing—please wait a moment.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return
+                }
                 if (appDirty) {
                     showUnsavedChangesDialog()
                 } else {
-                    val app = application as PdfCraftApplication
-                    // Merge process-death recovery with jobs staged this session.
-                    val recoverableJobs = LinkedHashMap<String, ExportQueue.ExportJob>()
-                    recoverableJobs.putAll(app.getRecoverableJobs())
-                    recoverableJobs.putAll(pendingExports)
+                    val recoverableJobs = getAllPendingExports()
                     if (recoverableJobs.isNotEmpty()) {
-                        showPendingExportsDialog(recoverableJobs)
+                        showPendingExportsDialog(recoverableJobs, isExitFlow = true)
                     } else {
                         isEnabled = false
                         onBackPressedDispatcher.onBackPressed()
@@ -476,84 +662,130 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showUnsavedChangesDialog() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle("Unsaved changes")
-            .setMessage("You have unsaved changes. Save before closing?")
-            .setPositiveButton("Save") { _, _ ->
-                Toast.makeText(this, "Use the Save button in PdfCraft before leaving", Toast.LENGTH_LONG).show()
+            .setMessage("You have unsaved edits in PdfCraft. Use the Save button inside the editor before leaving, or discard your unsaved edits.")
+            .setPositiveButton("Stay in editor", null)
+            .setNegativeButton("Discard edits") { _, _ ->
+                val recoverableJobs = getAllPendingExports()
+                if (recoverableJobs.isNotEmpty()) {
+                    showPendingExportsDialog(recoverableJobs, isExitFlow = true)
+                } else {
+                    finish()
+                }
             }
-            .setNegativeButton("Discard") { _, _ -> finish() }
-            .setNeutralButton("Cancel", null)
             .show()
     }
 
-    private fun showPendingExportsDialog(jobs: Map<String, ExportQueue.ExportJob>) {
-        val names = jobs.values.map { it.name }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Pending exports")
-            .setItems(names) { _, which ->
-                val job = jobs.values.elementAt(which)
-                requestSaveDestination(job)
+    private fun showPendingExportsDialog(
+        jobs: Map<String, ExportQueue.ExportJob>,
+        isExitFlow: Boolean
+    ) {
+        if (jobs.isEmpty()) return
+        val jobList = jobs.values.toList()
+        val labels = jobList.map { "${it.name} (${it.totalBytes / 1024} KiB)" }.toTypedArray()
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Pending exports (${jobList.size})")
+            .setItems(labels) { _, which ->
+                val selected = jobList[which]
+                showExportActionDialog(
+                    selected,
+                    title = selected.name,
+                    message = "Choose what to do with this staged export (${selected.totalBytes} bytes):"
+                )
             }
+            .setPositiveButton("Stay", null)
             .setNegativeButton("Discard all") { _, _ ->
-                jobs.values.forEach { job -> removeStagedExport(job) }
+                jobList.forEach { job -> removeStagedExport(job) }
+                if (isExitFlow) {
+                    finish()
+                }
+            }
+
+        if (isExitFlow) {
+            builder.setNeutralButton("Exit & keep for next launch") { _, _ ->
                 finish()
             }
-            .show()
+        }
+
+        builder.show()
     }
 
     private fun showErrorSurface(message: String, canRetry: Boolean) {
-        val errorView = android.widget.TextView(this).apply {
-            text = message
-            textSize = 18f
-            setPadding(48, 48, 48, 48)
+        errorSurfaceShowing = true
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(64, 64, 64, 64)
         }
 
-        val rootView = FrameLayout(this)
-        rootView.addView(errorView, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        ))
+        val errorView = TextView(this).apply {
+            text = message
+            textSize = 17f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 48)
+        }
+        container.addView(errorView)
 
         if (canRetry) {
-            val retryButton = com.google.android.material.button.MaterialButton(
-                this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle
-            )
-            retryButton.text = "Retry"
-            retryButton.setOnClickListener {
-                recreate()
+            val retryButton = MaterialButton(
+                this,
+                null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle
+            ).apply {
+                text = getString(R.string.retry)
+                setOnClickListener {
+                    errorSurfaceShowing = false
+                    recreate()
+                }
             }
-            rootView.addView(retryButton, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                android.view.Gravity.CENTER_HORIZONTAL or android.view.Gravity.BOTTOM
-            ).apply { setMargins(0, 0, 0, 120) })
+            container.addView(retryButton)
         }
 
-        setContentView(rootView)
+        val pending = getAllPendingExports()
+        if (pending.isNotEmpty()) {
+            val pendingButton = MaterialButton(
+                this,
+                null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle
+            ).apply {
+                text = "Pending exports (${pending.size})"
+                setOnClickListener {
+                    showPendingExportsDialog(pending, isExitFlow = false)
+                }
+            }
+            container.addView(pendingButton)
+        }
+
+        setContentView(
+            container,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
     }
 
-    private fun applyWindowInsets() {
-        // Apply status bar and navigation bar insets to the WebView container
-        val insetsController = WindowInsetsControllerCompat(window, webView)
-        val windowInsets = ViewCompat.getRootWindowInsets(webView)
-
-        if (windowInsets != null) {
-            val systemBars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val displayCutout = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val paddingTop = systemBars.top + displayCutout.top
-            val paddingRight = systemBars.right
-            val paddingLeft = systemBars.left + displayCutout.left
-            val paddingBottom = systemBars.bottom
-
-            webView.setPadding(paddingLeft, paddingTop, paddingRight, paddingBottom)
-            webView.setClipToPadding(false)
-            webView.setClipChildren(false)
+    private fun setupWindowInsetsListener() {
+        webView.clipToPadding = false
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, windowInsets ->
+            val insets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout() or
+                    WindowInsetsCompat.Type.ime()
+            )
+            view.setPadding(insets.left, insets.top, insets.right, insets.bottom)
+            WindowInsetsCompat.CONSUMED
         }
+        updateStatusBarAppearance(resources.configuration)
+    }
 
-        // Handle keyboard inset: adjustResize means the WebView will resize
-        // automatically. We only need to ensure the IME inset is not doubled.
-        insetsController.isAppearanceLightStatusBars = true
+    private fun updateStatusBarAppearance(config: Configuration) {
+        val isNightMode =
+            (config.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val insetsController = WindowInsetsControllerCompat(window, window.decorView)
+        insetsController.isAppearanceLightStatusBars = !isNightMode
+        insetsController.isAppearanceLightNavigationBars = !isNightMode
     }
 }

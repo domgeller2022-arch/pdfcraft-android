@@ -2,7 +2,7 @@
 # build-web.sh — Reproduce the PdfCraft WASM browser build from the pinned upstream commit.
 #
 # This script does NOT modify the upstream repository. It builds the existing
-# web target using Trunk and copies the output to build/web/.
+# web target using Trunk and copies the output to build/web/ and app/src/main/assets/pdfcraft/.
 #
 # Prerequisites:
 #   - rustup with wasm32-unknown-unknown target installed
@@ -13,28 +13,34 @@
 #
 set -euo pipefail
 
-# --- Resolve workspace paths ---
+# --- Resolve project and sibling workspace paths ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
-UPSTREAM="$WORKSPACE/pdfcraft-upstream"
-CRAFT_FONTS="$WORKSPACE/craft-fonts"
-BUILD_WEB="$WORKSPACE/build/web"
-BUILD_TARGET="$WORKSPACE/build/rust-target"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE_PARENT="$(cd "$PROJECT_ROOT/.." && pwd)"
 
-# --- Verify upstream is at the pinned commit ---
-PINNED_COMMIT="bbbe60015c571ebfc39708ee07777b89e267122a"
-ACTUAL_COMMIT="$(git -C "$UPSTREAM" rev-parse HEAD)"
-if [ "$ACTUAL_COMMIT" != "$PINNED_COMMIT" ]; then
-    echo "ERROR: upstream is at $ACTUAL_COMMIT, expected $PINNED_COMMIT"
-    exit 1
+# Support sibling layout (../pdfcraft-upstream) with fallback to local or env override
+if [ -n "${PDFCRAFT_UPSTREAM_DIR:-}" ]; then
+    UPSTREAM="$PDFCRAFT_UPSTREAM_DIR"
+elif [ -d "$WORKSPACE_PARENT/pdfcraft-upstream" ]; then
+    UPSTREAM="$WORKSPACE_PARENT/pdfcraft-upstream"
+else
+    UPSTREAM="$PROJECT_ROOT/pdfcraft-upstream"
 fi
 
-if ! git -C "$UPSTREAM" diff --quiet HEAD; then
-    echo "ERROR: upstream working tree is not clean"
-    exit 1
+if [ -n "${CRAFT_FONTS_DIR:-}" ]; then
+    CRAFT_FONTS="$CRAFT_FONTS_DIR"
+elif [ -d "$WORKSPACE_PARENT/craft-fonts" ]; then
+    CRAFT_FONTS="$WORKSPACE_PARENT/craft-fonts"
+else
+    CRAFT_FONTS="$PROJECT_ROOT/craft-fonts"
 fi
 
-echo "✓ Upstream verified at $PINNED_COMMIT"
+BUILD_WEB="$PROJECT_ROOT/build/web"
+BUILD_TARGET="$PROJECT_ROOT/build/rust-target"
+ASSETS_PDFCRAFT="$PROJECT_ROOT/app/src/main/assets/pdfcraft"
+
+# --- Verify upstream is at the pinned commit and clean ---
+python3 "$SCRIPT_DIR/verify-upstream.py" "$UPSTREAM"
 
 # --- Verify craft-fonts is at the pinned commit ---
 PINNED_FONTS_COMMIT="8dcdacd5153e64560d109541a47d806f26f048c0"
@@ -63,7 +69,7 @@ TRUNK_VERSION="$(trunk --version)"
 echo "✓ trunk: $TRUNK_VERSION"
 
 # --- Create output directories ---
-mkdir -p "$BUILD_WEB" "$BUILD_TARGET"
+mkdir -p "$BUILD_WEB" "$BUILD_TARGET" "$ASSETS_PDFCRAFT"
 
 # --- Build the WASM web app ---
 echo ""
@@ -83,8 +89,12 @@ if [ ! -f "$BUILD_WEB/index.html" ]; then
     exit 1
 fi
 
+# --- Sync verified web build into Android assets and re-verify upstream ---
+rm -f "$ASSETS_PDFCRAFT"/*
+cp -f "$BUILD_WEB"/* "$ASSETS_PDFCRAFT"/
+python3 "$SCRIPT_DIR/verify-upstream.py" "$UPSTREAM"
+
 echo ""
-echo "✓ Web build complete at $BUILD_WEB"
+echo "✓ Web build complete at $BUILD_WEB and synced to $ASSETS_PDFCRAFT"
 echo ""
-echo "Output files:"
-ls -la "$BUILD_WEB/"
+ls -la "$ASSETS_PDFCRAFT/"

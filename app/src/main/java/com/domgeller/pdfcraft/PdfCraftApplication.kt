@@ -3,13 +3,15 @@ package com.domgeller.pdfcraft
 import android.app.Application
 import android.util.Log
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * Application class for PdfCraft Android.
  *
- * Initializes the export queue and recovers any pending exports from a previous process.
- * Does NOT hold an Activity-owned WebView in a long-lived object — the WebView is
- * created and destroyed with the Activity lifecycle.
+ * Owns the single shared ExportQueue and the background disk I/O executor so that
+ * Activity recreation (e.g., during a system file picker or configuration change)
+ * never aborts an in-flight staging or destination-copy task.
  */
 class PdfCraftApplication : Application() {
 
@@ -17,50 +19,41 @@ class PdfCraftApplication : Application() {
         const val TAG = "PdfCraftApp"
     }
 
-    /**
-     * App-private persistent staging directory for exported documents.
-     * Not disposable cache: survives process death for pending-export recovery.
-     */
     val stagingDir: File by lazy {
         File(filesDir, "staging").apply { mkdirs() }
     }
 
-    /**
-     * App-private metadata directory for tracking pending exports.
-     */
     val metadataDir: File by lazy {
         File(filesDir, "metadata").apply { mkdirs() }
     }
 
+    val exportQueue: ExportQueue by lazy {
+        ExportQueue(stagingDir, metadataDir)
+    }
+
     /**
-     * Recovered export jobs from a previous process lifecycle.
-     * Populated in onCreate() and consumed by MainActivity for the recovery UI.
+     * Application-scoped background executor for document I/O and export staging.
      */
-    private val _recoveredJobs: MutableMap<String, ExportQueue.ExportJob> = mutableMapOf()
+    val ioExecutor: ExecutorService by lazy {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "PdfCraft-IO").apply { isDaemon = true }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "PdfCraft application created")
 
-        // Recover any pending exports from a previous process lifecycle.
-        val recovered = ExportQueue.recoverPendingExports(stagingDir, metadataDir)
-        _recoveredJobs.putAll(recovered)
+        val recovered = exportQueue.getRecoverableJobs()
         if (recovered.isNotEmpty()) {
             Log.i(TAG, "Recovered ${recovered.size} pending exports")
         }
     }
 
-    /**
-     * Returns a snapshot of jobs recovered from a previous process lifecycle.
-     * The caller should clear individual jobs via clearRecoveredJob(transferId)
-     * once they have been resumed or discarded.
-     */
-    fun getRecoverableJobs(): Map<String, ExportQueue.ExportJob> = _recoveredJobs.toMap()
+    fun getRecoverableJobs(): Map<String, ExportQueue.ExportJob> =
+        exportQueue.getRecoverableJobsMap()
 
-    /**
-     * Remove a job from the recovered set after it has been resumed or discarded.
-     */
     fun clearRecoveredJob(transferId: String) {
-        _recoveredJobs.remove(transferId)
+        exportQueue.clearRecoveredJob(transferId)
     }
 }

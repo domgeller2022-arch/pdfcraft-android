@@ -4,14 +4,16 @@
 # output to a log file that can be checked later.
 set -euo pipefail
 
-WORKSPACE="/Users/dd/Desktop/PDF Craft for Android"
-UPSTREAM="$WORKSPACE/pdfcraft-upstream"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE="${PDFCRAFT_WORKSPACE:-$(cd "$PROJECT_ROOT/.." && pwd)}"
+UPSTREAM="${PDFCRAFT_UPSTREAM_DIR:-$WORKSPACE/pdfcraft-upstream}"
 WEB_DIR="$UPSTREAM/apps/pdfcraft-web"
-BUILD_WEB="$WORKSPACE/pdfcraft-android/build/web"
-BUILD_TARGET="$WORKSPACE/pdfcraft-android/build/rust-target"
-CRAFT_FONTS="$WORKSPACE/craft-fonts"
-LOG_FILE="$WORKSPACE/pdfcraft-android/build/web-build.log"
-PID_FILE="$WORKSPACE/pdfcraft-android/build/web-build.pid"
+BUILD_WEB="$PROJECT_ROOT/build/web"
+BUILD_TARGET="$PROJECT_ROOT/build/rust-target"
+CRAFT_FONTS="${CRAFT_FONTS_DIR:-$WORKSPACE/craft-fonts}"
+LOG_FILE="$PROJECT_ROOT/build/web-build.log"
+PID_FILE="$PROJECT_ROOT/build/web-build.pid"
 
 export CRAFT_FONTS_DIR="$CRAFT_FONTS"
 export CRAFT_FONTS_REQUIRED=1
@@ -42,13 +44,11 @@ echo "Rust target dir: $BUILD_TARGET" >> "$LOG_FILE"
 echo "CRAFT_FONTS_DIR: $CRAFT_FONTS" >> "$LOG_FILE"
 echo "" >> "$LOG_FILE"
 
-# Start the build in the background with nohup so it survives shell exit
-# trunk must be run from the web app directory (it reads Trunk.toml from CWD)
-nohup bash -c '
-  cd "/Users/dd/Desktop/PDF Craft for Android/pdfcraft-upstream/apps/pdfcraft-web"
-  trunk build --release --locked --dist "/Users/dd/Desktop/PDF Craft for Android/pdfcraft-android/build/web"
-  echo "BUILD_EXIT=$?"
-' >> "$LOG_FILE" 2>&1 &
+nohup bash -c "
+  cd \"$WEB_DIR\"
+  trunk build --release --locked --dist \"$BUILD_WEB\"
+  echo \"BUILD_EXIT=\$?\"
+" >> "$LOG_FILE" 2>&1 &
 
 BUILD_PID=$!
 echo $BUILD_PID > "$PID_FILE"

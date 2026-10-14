@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Narrowly scoped to the app-private staging directory for sharing exported documents -->
+    <files-path
+        name="staged_exports"
+        path="staging/" />
+</paths>
