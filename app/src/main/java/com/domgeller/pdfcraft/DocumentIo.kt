@@ -6,9 +6,6 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.database.Cursor
-import android.os.ParcelFileDescriptor
-import androidx.documentfile.provider.DocumentFile
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
@@ -61,7 +58,8 @@ object DocumentIo {
 
     /**
      * Read all bytes from a content:// URI. Validates that the URI is a content://
-     * scheme and that the data is readable.
+     * scheme and that the data is readable. Reads dynamically to avoid
+     * truncation or padding when the document provider reports an inaccurate size.
      */
     @Throws(IOException::class, SecurityException::class)
     fun readBytes(context: Context, uri: Uri): ByteArray {
@@ -70,33 +68,14 @@ object DocumentIo {
         }
 
         val resolver = context.contentResolver
-        val cursor: Cursor? = resolver.query(
-            uri, arrayOf(OpenableColumns.SIZE), null, null, null
-        )
-        val size = cursor?.use { c ->
-            if (c.moveToFirst()) c.getLong(0) else -1L
-        } ?: -1L
-
         resolver.openInputStream(uri)?.use { input ->
-            return if (size > 0 && size <= Int.MAX_VALUE) {
-                val bytes = ByteArray(size.toInt())
-                var read = 0
-                while (read < size) {
-                    val n = input.read(bytes, read, size.toInt() - read)
-                    if (n == -1) break
-                    read += n
-                }
-                bytes
-            } else {
-                // Unknown size — read dynamically
-                val buffer = java.io.ByteArrayOutputStream()
-                val buf = ByteArray(BUFFER_SIZE)
-                var n: Int
-                while (input.read(buf).also { n = it } != -1) {
-                    buffer.write(buf, 0, n)
-                }
-                buffer.toByteArray()
+            val buffer = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(BUFFER_SIZE)
+            var n: Int
+            while (input.read(buf).also { n = it } != -1) {
+                buffer.write(buf, 0, n)
             }
+            return buffer.toByteArray()
         } ?: throw IOException("Cannot open input stream for $uri")
     }
 

@@ -10,6 +10,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -23,7 +24,7 @@ import java.util.concurrent.Executors
 class HostMessageBridge(
     private val webView: WebView,
     private val assetOrigin: String,
-    private val assetPath: String,
+    private val bridgeObjectName: String = "WebMessageListener",
     private val stagingDir: File,
     private val metadataDir: File,
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
@@ -69,14 +70,35 @@ class HostMessageBridge(
             callback.onAppFailed("WebView does not support WEB_MESSAGE_LISTENER")
             return
         }
-        WebViewCompat.addWebMessageListener(webView, assetPath, emptySet(), this)
-        Log.d(TAG, "WebMessageListener registered for origin=$assetOrigin")
+        // Inject download-adapter.js as a document-start script so it intercepts
+        // Blob downloads inside the iframe before upstream app scripts run.
+        // The adapter self-exits on the host page via pathname check.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            val adapterScript = readAsset("shell/download-adapter.js")
+            if (adapterScript != null) {
+                WebViewCompat.addDocumentStartJavaScript(webView, adapterScript, setOf(assetOrigin))
+                Log.d(TAG, "Download adapter injected as document-start script")
+            }
+        } else {
+            Log.w(TAG, "DOCUMENT_START_SCRIPT not supported; adapter injection deferred to host.js")
+        }
+        WebViewCompat.addWebMessageListener(webView, bridgeObjectName, setOf(assetOrigin), this)
+        Log.d(TAG, "WebMessageListener registered: name=$bridgeObjectName, origin=$assetOrigin")
+    }
+
+    private fun readAsset(path: String): String? {
+        return try {
+            webView.context.assets.open(path).bufferedReader().readText()
+        } catch (e: IOException) {
+            Log.e(TAG, "Failed to read asset: $path", e)
+            null
+        }
     }
 
     fun unregister() {
         isDestroyed = true
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            WebViewCompat.removeWebMessageListener(webView, assetPath)
+            WebViewCompat.removeWebMessageListener(webView, bridgeObjectName)
         }
     }
 
@@ -152,6 +174,17 @@ class HostMessageBridge(
                 val saveAs = json.optBoolean("saveAs", false)
                 val totalBytes = json.optLong("totalBytes", 0)
                 finalizeChunkedSave(transferId, name, saveAs, totalBytes)
+            }
+
+            "host:blobDownload" -> {
+                val transferId = json.optString("transferId", "blob_" + System.currentTimeMillis())
+                val name = json.optString("filename", json.optString("name", "download.pdf"))
+                val bytes = decodeBase64(json.optString("bytes"))
+                if (bytes != null) {
+                    handleSave(transferId, name, false, bytes)
+                } else {
+                    Log.e(TAG, "host:blobDownload: invalid or missing bytes")
+                }
             }
         }
     }

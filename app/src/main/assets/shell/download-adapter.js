@@ -1,134 +1,98 @@
 /**
- * download-adapter.js — document-start adapter that intercepts Blob downloads
- * from the embedded PdfCraft app and forwards them to the Android host for
- * durable staging and destination export.
+ * download-adapter.js — intercepts Blob downloads from the embedded PdfCraft
+ * web app and forwards them to the Android host for durable staging and
+ * destination export.
  *
  * This is a separate runtime adapter (NOT part of the upstream repository).
  * It does not edit generated JS/WASM, change the PDF algorithm, or modify
  * application behavior beyond capturing downloads before Blob URL revocation.
  *
- * Installed before the iframe's application scripts execute, scoped to the
- * asset origin and expected document path.
+ * Inject into the iframe by host.js after load — this script self-exits
+ * when running on the host page (pathname starts with /assets/shell/).
  */
-
 (function () {
     'use strict';
 
     const ASSET_ORIGIN = "https://appassets.androidplatform.net";
-    const PDFRAFT_PATH = "/assets/pdfcraft/index.html";
 
-    // Only inject on the pdfcraft index page, not on the host page itself.
+    // Only run inside the pdfcraft iframe, not on the host page.
     if (window.location.origin !== ASSET_ORIGIN) return;
     if (!window.location.pathname.startsWith("/assets/pdfcraft/")) return;
 
+    // Idempotent installation guard. Both the Android document-start injection
+    // and the host.js iframe-load fallback can execute this file; without this
+    // guard each injection would add another layer of hooks and emit duplicate
+    // exports for a single download click.
+    if (window.__pdfCraftDownloadAdapterInstalled) return;
+    window.__pdfCraftDownloadAdapterInstalled = true;
+
     // --- Track Blob objects created by URL.createObjectURL ---
-    const blobMap = new Map();
+    // We keep references to prevent premature GC while FileReader reads asynchronously.
+    const blobMap = new Map();        // originalUrl -> Blob
+    const processedElements = new WeakSet();  // prevent duplicate processing per element
     const originalCreateObjectURL = URL.createObjectURL;
     const originalRevokeObjectURL = URL.revokeObjectURL;
-    let objectId = 0;
 
+    // Return the real Blob URL (not a fake replacement) so the upstream app's
+    // <a href> stays valid. We just track the mapping internally.
     URL.createObjectURL = function (obj) {
         if (obj instanceof Blob) {
-            const id = "blob:" + (++objectId);
-            blobMap.set(id, obj);
-            return id;
+            const url = originalCreateObjectURL.call(this, obj);
+            blobMap.set(url, obj);
+            return url;
         }
         return originalCreateObjectURL.call(this, obj);
     };
 
+    // Defer revocation until we've finished reading the Blob asynchronously.
     URL.revokeObjectURL = function (url) {
-        // Retain the Blob: don't actually revoke until the export is captured.
-        // The original revocation is a no-op here for tracked Blobs.
-        // We clean up after the export/stage cycle completes.
         if (blobMap.has(url)) {
-            // Keep the blob; it will be released after the download is captured.
+            // Schedule cleanup: read is still in flight, revoke after
+            setTimeout(() => { blobMap.delete(url); }, 5000);
             return;
         }
         return originalRevokeObjectURL.call(this, url);
     };
 
-    // --- Intercept download anchor clicks ---
-    // The existing web code does: create Blob URL, set anchor.href, anchor.click(), revoke URL.
-    // We intercept the click to capture the Blob bytes synchronously.
+    // --- Intercept download anchor clicks via prototype override ---
+    // The upstream web code does: create Blob URL, set anchor.href,
+    // anchor.click(), revoke URL. We intercept click() to capture the Blob.
     const originalClick = HTMLElement.prototype.click;
     HTMLElement.prototype.click = function () {
-        // Check if this is an <a download> element with a blob: href
-        if (this.tagName === "A" || this.tagName === "a") {
+        if ((this.tagName === "A" || this.tagName === "a") && !processedElements.has(this)) {
             const href = this.getAttribute("href");
             if (href && href.startsWith("blob:") && blobMap.has(href)) {
+                processedElements.add(this);
                 const blob = blobMap.get(href);
                 const filename = this.getAttribute("download") || "download.pdf";
 
-                // Retain the blob reference synchronously before click proceeds
-                const blobCopy = blob.slice(0, blob.size, blob.type);
-                blobMap.set(href + ":captured", blobCopy);
-
-                // Read the blob as ArrayBuffer and forward to the parent
                 const reader = new FileReader();
                 reader.onload = function () {
                     const bytes = reader.result;
-                    const parentOrigin = window.parent ? window.parent.location.origin : null;
-                    if (parentOrigin === ASSET_ORIGIN) {
+                    if (window.parent && window.parent.location.origin === ASSET_ORIGIN) {
                         window.parent.postMessage({
                             type: "host:blobDownload",
+                            transferId: "blob_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11),
                             filename: filename,
                             mimeType: blob.type || "application/pdf",
                             bytes: bytes
                         }, ASSET_ORIGIN, [bytes]);
                     }
-                    // Release the retained copy
-                    blobMap.delete(href + ":captured");
+                    // Release the retained Blob reference
+                    blobMap.delete(href);
+                    originalRevokeObjectURL.call(URL, href);
                 };
                 reader.onerror = function () {
-                    blobMap.delete(href + ":captured");
+                    blobMap.delete(href);
                 };
-                reader.readAsArrayBuffer(blobCopy);
+                reader.readAsArrayBuffer(blob);
             }
         }
         return originalClick.call(this);
     };
 
-    // --- Also catch programmatic click() calls on dynamically created anchors ---
-    const originalCreateElement = Document.prototype.createElement;
-    Document.prototype.createElement = function (tag) {
-        const el = originalCreateElement.call(this, tag);
-        if (tag.toLowerCase() === "a") {
-            const originalClick2 = el.click;
-            el.click = function () {
-                const href = this.getAttribute("href");
-                if (href && href.startsWith("blob:") && blobMap.has(href)) {
-                    const blob = blobMap.get(href);
-                    const filename = this.getAttribute("download") || "download";
-
-                    const blobCopy = blob.slice(0, blob.size, blob.type);
-                    const reader = new FileReader();
-                    reader.onload = function () {
-                        const bytes = reader.result;
-                        if (window.parent && window.parent.location.origin === ASSET_ORIGIN) {
-                            window.parent.postMessage({
-                                type: "host:blobDownload",
-                                filename: filename,
-                                mimeType: blob.type || "application/pdf",
-                                bytes: bytes
-                            }, ASSET_ORIGIN, [bytes]);
-                        }
-                    };
-                    reader.readAsArrayBuffer(blobCopy);
-                }
-                return originalClick2.call(this);
-            };
-        }
-        return el;
-    };
-
     // --- Cleanup on page unload ---
     window.addEventListener("beforeunload", function () {
         blobMap.clear();
-    });
-
-    // Signal to host that the download adapter is active
-    window.addEventListener("message", function (event) {
-        if (event.origin !== ASSET_ORIGIN) return;
-        // No-op: adapter is passive, just intercepts downloads
     });
 })();

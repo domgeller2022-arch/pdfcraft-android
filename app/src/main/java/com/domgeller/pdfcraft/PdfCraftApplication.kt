@@ -32,11 +32,35 @@ class PdfCraftApplication : Application() {
         File(filesDir, "metadata").apply { mkdirs() }
     }
 
+    /**
+     * Recovered export jobs from a previous process lifecycle.
+     * Populated in onCreate() and consumed by MainActivity for the recovery UI.
+     */
+    private val _recoveredJobs: MutableMap<String, ExportQueue.ExportJob> = mutableMapOf()
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "PdfCraft application created")
 
         // Recover any pending exports from a previous process lifecycle.
-        ExportQueue.recoverPendingExports(stagingDir, metadataDir)
+        val recovered = ExportQueue.recoverPendingExports(stagingDir, metadataDir)
+        _recoveredJobs.putAll(recovered)
+        if (recovered.isNotEmpty()) {
+            Log.i(TAG, "Recovered ${recovered.size} pending exports")
+        }
+    }
+
+    /**
+     * Returns a snapshot of jobs recovered from a previous process lifecycle.
+     * The caller should clear individual jobs via clearRecoveredJob(transferId)
+     * once they have been resumed or discarded.
+     */
+    fun getRecoverableJobs(): Map<String, ExportQueue.ExportJob> = _recoveredJobs.toMap()
+
+    /**
+     * Remove a job from the recovered set after it has been resumed or discarded.
+     */
+    fun clearRecoveredJob(transferId: String) {
+        _recoveredJobs.remove(transferId)
     }
 }

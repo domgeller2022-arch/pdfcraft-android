@@ -29,8 +29,18 @@ class ExportQueue(
     companion object {
         const val TAG = "ExportQueue"
         private const val CHUNK_ACK_TIMEOUT_MS = 30_000L
-        private const val MAX_STAGING_BYTES = 2L * 1024 * 1024 * 1024 // 2 GB
+        internal const val MAX_STAGING_BYTES = 2L * 1024 * 1024 * 1024 // 2 GB
         private const val STAGING_BUFFER_SIZE = 256 * 1024 // 256 KiB
+
+        /**
+         * Validate a transfer size against the staging limit. Takes a Long so the
+         * guard can be exercised without allocating a multi-gigabyte byte array.
+         */
+        internal fun validateStagingSize(byteCount: Long) {
+            if (byteCount > MAX_STAGING_BYTES) {
+                throw IOException("Export exceeds maximum staging size of $MAX_STAGING_BYTES bytes")
+            }
+        }
 
         /**
          * Recover pending exports from a previous process lifecycle.
@@ -157,10 +167,8 @@ class ExportQueue(
         val safeName = safeFilename(name)
         val stageFile = File(stagingDir, "${transferId}__$safeName")
 
-        // Check size limit
-        if (bytes.size > MAX_STAGING_BYTES) {
-            throw IOException("Export exceeds maximum staging size of $MAX_STAGING_BYTES bytes")
-        }
+        // Check size limit against the Long limit (see validateStagingSize)
+        validateStagingSize(bytes.size.toLong())
 
         // Write atomically: temp file + rename
         writeAtomically(stageFile, bytes)

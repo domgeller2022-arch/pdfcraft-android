@@ -1,6 +1,8 @@
 package com.domgeller.pdfcraft
 
 import android.content.Context
+import android.net.Uri
+import android.util.Log
 import android.webkit.WebResourceResponse
 import androidx.webkit.WebViewAssetLoader
 import java.io.File
@@ -41,12 +43,12 @@ class LocalContentServer(private val context: Context) {
          * application/wasm and JS as text/javascript.
          */
         private val MIME_TYPES = mapOf(
-            ".html" to "text/html; charset=utf-8",
-            ".css" to "text/css; charset=utf-8",
-            ".js" to "text/javascript; charset=utf-8",
+            ".html" to "text/html",
+            ".css" to "text/css",
+            ".js" to "text/javascript",
             ".wasm" to "application/wasm",
-            ".json" to "application/json; charset=utf-8",
-            ".svg" to "image/svg+xml; charset=utf-8",
+            ".json" to "application/json",
+            ".svg" to "image/svg+xml",
             ".png" to "image/png",
             ".jpg" to "image/jpeg",
             ".jpeg" to "image/jpeg",
@@ -55,7 +57,7 @@ class LocalContentServer(private val context: Context) {
             ".woff2" to "font/woff2",
             ".ttf" to "font/ttf",
             ".ico" to "image/x-icon",
-            ".map" to "application/json; charset=utf-8"
+            ".map" to "application/json"
         )
 
         /**
@@ -77,13 +79,42 @@ class LocalContentServer(private val context: Context) {
      * preventing fallback to network access.
      */
     fun createAssetLoader(): WebViewAssetLoader {
-        val assetsHandler = WebViewAssetLoader.AssetsPathHandler(context)
+        val assetsHandler = WebViewAssetLoader.PathHandler { path ->
+            if (!(path.startsWith("shell/") || path.startsWith("pdfcraft/")) ||
+                path.split('/').any { it == "." || it == ".." }) {
+                notFound()
+            } else {
+                try {
+                    val stream = context.assets.open(path)
+                    val mime = getMimeType(path)
+                    val encoding = if (mime.startsWith("text/") ||
+                        mime == "application/json" || mime == "image/svg+xml") "UTF-8" else null
+                    WebResourceResponse(mime, encoding, 200, "OK",
+                        mapOf("Cache-Control" to "no-cache"), stream)
+                } catch (error: IOException) {
+                    Log.e(TAG, "Missing bundled asset: $path", error)
+                    notFound()
+                }
+            }
+        }
         return WebViewAssetLoader.Builder()
-            .addPathHandler("/shell/", assetsHandler)
-            .addPathHandler("/pdfcraft/", assetsHandler)
-            .addPathHandler("/", assetsHandler)
+            // Only /assets/ is removed. The remaining shell/... or pdfcraft/...
+            // is the actual path relative to the APK's assets directory.
+            .addPathHandler("/assets/", assetsHandler)
             .build()
     }
+
+    fun interceptRequest(loader: WebViewAssetLoader, uri: Uri): WebResourceResponse? {
+        if (uri.scheme != "https" || uri.host != "appassets.androidplatform.net" ||
+            (uri.port != -1 && uri.port != 443)) return null
+        // Unknown local paths must not fall back to network access.
+        return loader.shouldInterceptRequest(uri) ?: notFound()
+    }
+
+    private fun notFound(): WebResourceResponse = WebResourceResponse(
+        "text/plain", "UTF-8", 404, "Not Found", emptyMap(),
+        "Bundled resource not found".byteInputStream(Charsets.UTF_8)
+    )
 
     /**
      * Intercept a URL and serve the local asset response.

@@ -12,6 +12,7 @@
  *                    {"type":"host:failed","error":"msg"}
  *                    {"type":"host:saveChunk","transferId":"t0","name":"doc.pdf","saveAs":true,"totalBytes":N,"seq":i,"totalChunks":N,"data":"<base64 chunk>"}
  *                    {"type":"host:saveComplete","transferId":"t0","name":"doc.pdf","saveAs":true,"totalBytes":N}
+ *                    {"type":"host:blobDownload","transferId":"blob_t0","filename":"doc.pdf","mimeType":"application/pdf","bytes":"<base64>"}
  *   Android → Web:  {"type":"host:import","name":"doc.pdf","bytes":"<base64>"}
  *                    {"type":"host:importChunk","transferId":"imp1","name":"doc.pdf","totalBytes":N,"seq":i,"totalChunks":N,"data":"<base64 chunk>"}
  *
@@ -28,11 +29,50 @@
     let pendingImports = [];
     let importChunks = new Map(); // transferId -> {name, chunks[], totalChunks}
 
+    // Monotonic counter for save IDs — avoids Date.now() collisions when multiple
+    // saves happen in the same millisecond.
+    let saveCounter = 0;
+
+    // ─── Inject download-adapter.js into the iframe (fallback) ─────────
+    // When DOCUMENT_START_SCRIPT is unavailable on the device, host.js injects
+    // the adapter into the iframe after load. This covers the common case
+    // where downloads are triggered by user interaction after page load.
+    function injectDownloadAdapter() {
+        try {
+            const doc = frame.contentDocument;
+            if (!doc) return;
+            // Check if already injected
+            if (doc.querySelector('script[src="/assets/shell/download-adapter.js"]')) return;
+            const script = doc.createElement('script');
+            script.src = '/assets/shell/download-adapter.js';
+            doc.head.appendChild(script);
+        } catch (e) {
+            console.warn('Failed to inject download adapter into iframe:', e);
+        }
+    }
+
+    // Try to inject after the iframe loads
+    frame.addEventListener('load', injectDownloadAdapter);
+    // Also retry when the iframe navigates (SPA-style)
+    frame.addEventListener('DOMContentLoaded', function() {
+        requestAnimationFrame(injectDownloadAdapter);
+    });
+
     // ─── Single message listener handling BOTH iframe→host and Android→host ──
     window.addEventListener("message", function (event) {
         if (event.origin !== ASSET_ORIGIN) return;
 
-        const data = event.data;
+        // Android's postWebMessage delivers JSON strings, while the iframe's
+        // postMessage delivers objects. Parse strings before processing.
+        let data = event.data;
+        if (typeof data === 'string') {
+            try {
+                data = JSON.parse(data);
+            } catch (e) {
+                console.warn("Ignoring unparseable message string:", data);
+                return;
+            }
+        }
         if (!data || typeof data.type !== "string") return;
 
         // --- Messages FROM the PdfCraft iframe ---
@@ -55,12 +95,18 @@
                 case "pdfcraft:failed":
                     sendToNative({ type: "host:failed", error: data.error || "unknown error" });
                     break;
+
+                case "host:blobDownload":
+                    // Emitted by download-adapter.js running INSIDE the iframe, so it
+                    // arrives with event.source === frame.contentWindow. Handle it here
+                    // in the validated iframe branch before the early return.
+                    handleBlobDownloadFromIframe(data);
+                    break;
             }
             return;
         }
 
-        // --- Messages FROM the Android host (via postWebMessage) ---
-        // event.source === window
+        // --- Messages FROM the Android host (via postWebMessage as JSON string) ---
         switch (data.type) {
             case "host:import":
                 if (appReady) {
@@ -133,8 +179,12 @@
     }
 
     // ─── Handle pdfcraft:save from the iframe ──────────────────────────
+    function generateSaveId() {
+        return "t" + Date.now() + "_" + (++saveCounter);
+    }
+
     function handleSaveToNative(data) {
-        const id = "t" + Date.now();
+        const id = generateSaveId();
         const name = data.name || "document.pdf";
         const saveAs = !!data.saveAs;
         const buffer = toArrayBuffer(data.bytes);
@@ -179,10 +229,30 @@
         }
     }
 
+    // ─── Handle host:blobDownload emitted by download-adapter.js (iframe) ──
+    function handleBlobDownloadFromIframe(data) {
+        const buffer = toArrayBuffer(data.bytes);
+        if (!buffer) {
+            console.error("host:blobDownload: invalid bytes payload");
+            return;
+        }
+        sendToNative({
+            type: "host:blobDownload",
+            transferId: data.transferId || ("blob_" + Date.now()),
+            filename: data.filename || data.name || "download.pdf",
+            mimeType: data.mimeType || "application/pdf",
+            bytes: arrayBufferToBase64(buffer)
+        });
+    }
+
     // ─── Utilities ────────────────────────────────────────────────────────
+    // Realm-agnostic type checks: messages cross the iframe↔parent boundary and
+    // `instanceof` is unreliable across realms. Object.prototype.toString and
+    // ArrayBuffer.isView behave consistently regardless of the source realm.
     function toArrayBuffer(input) {
-        if (input instanceof ArrayBuffer) return input;
-        if (input instanceof Uint8Array) return input.buffer;
+        if (!input) return null;
+        if (Object.prototype.toString.call(input) === "[object ArrayBuffer]") return input;
+        if (ArrayBuffer.isView(input)) return input.buffer;
         return null;
     }
 
@@ -216,6 +286,7 @@
         sendToNative: sendToNative,
         handleSave: handleSaveToNative,
         sendOpenToIframe: sendOpenToIframe,
-        flushQueuedImports: flushQueuedImports
+        flushQueuedImports: flushQueuedImports,
+        generateSaveId: generateSaveId
     };
 })();

@@ -5,10 +5,10 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.view.KeyEvent
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceError
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -16,6 +16,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.getSystemService
@@ -26,6 +27,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import androidx.webkit.WebViewAssetLoader
+import java.io.File
 import java.util.concurrent.Executors
 
 /**
@@ -67,6 +69,13 @@ class MainActivity : ComponentActivity() {
     // Current export job awaiting destination selection
     private var currentExportJob: ExportQueue.ExportJob? = null
 
+    // Jobs staged this session that still need a destination. Kept across
+    // cancellation so the back-press recovery dialog can offer a retry.
+    private val pendingExports = LinkedHashMap<String, ExportQueue.ExportJob>()
+
+    // Serializes destination pickers: only one may be in flight at a time.
+    private val pickerQueue = ArrayDeque<ExportQueue.ExportJob>()
+
     data class PendingImport(val name: String, val bytes: ByteArray)
 
     // ActivityResultLauncher for save destination picker
@@ -74,7 +83,10 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val job = currentExportJob
             currentExportJob = null
-            if (job == null) return@registerForActivityResult
+            if (job == null) {
+                advancePickerQueue()
+                return@registerForActivityResult
+            }
 
             if (result.resultCode == RESULT_OK) {
                 val destUri = result.data?.data
@@ -86,6 +98,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 handleSaveCancelled(job)
             }
+            advancePickerQueue()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -133,7 +146,23 @@ class MainActivity : ComponentActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView, request: WebResourceRequest
-            ): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+            ): WebResourceResponse? = localContentServer.interceptRequest(assetLoader, request.url)
+
+            override fun onReceivedError(
+                view: WebView, request: WebResourceRequest, error: WebResourceError
+            ) {
+                if (request.isForMainFrame) {
+                    showErrorSurface("Unable to load bundled PdfCraft: ${error.description}", true)
+                }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView, request: WebResourceRequest, response: WebResourceResponse
+            ) {
+                if (request.isForMainFrame) {
+                    showErrorSurface("Bundled PdfCraft resource failed (${response.statusCode}).", true)
+                }
+            }
 
             override fun shouldOverrideUrlLoading(
                 view: WebView, url: String
@@ -159,15 +188,15 @@ class MainActivity : ComponentActivity() {
         messageBridge = HostMessageBridge(
             webView = webView,
             assetOrigin = LocalContentServer.ASSET_ORIGIN,
-            assetPath = "/",
+            bridgeObjectName = "WebMessageListener",
             stagingDir = app.stagingDir,
             metadataDir = app.metadataDir,
             executor = ioExecutor,
             callback = object : HostMessageBridge.BridgeCallback {
                 override fun onSaveStaged(transferId: String, job: ExportQueue.ExportJob) {
                     runOnUiThread {
-                        currentExportJob = job
-                        showSaveDestinationPicker(job)
+                        pendingExports[job.transferId] = job
+                        requestSaveDestination(job)
                     }
                 }
 
@@ -203,6 +232,9 @@ class MainActivity : ComponentActivity() {
             }
         )
         messageBridge?.register()
+
+        // Set up back button handling with AndroidX OnBackPressedDispatcher
+        setupBackHandling()
 
         // Load the host page via the asset loader
         webView.loadUrl(LocalContentServer.HOST_URL)
@@ -286,6 +318,37 @@ class MainActivity : ComponentActivity() {
         messageBridge?.sendImport(name, bytes)
     }
 
+    /**
+     * Serialize destination pickers: if one is already showing, queue this job
+     * until the current picker returns.
+     */
+    private fun requestSaveDestination(job: ExportQueue.ExportJob) {
+        if (currentExportJob != null) {
+            pickerQueue.addLast(job)
+            return
+        }
+        currentExportJob = job
+        showSaveDestinationPicker(job)
+    }
+
+    private fun advancePickerQueue() {
+        val next = pickerQueue.removeFirstOrNull() ?: return
+        currentExportJob = next
+        showSaveDestinationPicker(next)
+    }
+
+    /**
+     * Remove an export from pending/recovery tracking and delete its staged file
+     * plus metadata. Used after a verified save or an explicit discard.
+     */
+    private fun removeStagedExport(job: ExportQueue.ExportJob) {
+        pendingExports.remove(job.transferId)
+        val app = application as PdfCraftApplication
+        app.clearRecoveredJob(job.transferId)
+        try { job.stageFile.delete() } catch (_: Exception) {}
+        try { File(app.metadataDir, "${job.transferId}.job").delete() } catch (_: Exception) {}
+    }
+
     private fun showSaveDestinationPicker(job: ExportQueue.ExportJob) {
         val safeName = job.name.replace("[^\\w\\-. ]".toRegex(), "_").ifEmpty { "document.pdf" }
 
@@ -312,6 +375,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (verified) {
                         Log.i(TAG, "Export verified: ${job.transferId}")
+                        removeStagedExport(job)
                         messageBridge?.sendToHost(
                             """{"type":"host:saveResult","transferId":"${job.transferId}","success":true}"""
                         )
@@ -340,7 +404,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleSaveCancelled(job: ExportQueue.ExportJob) {
-        // Cancelled exports remain pending with Retry/Share/explicit Delete controls
+        // Keep the staged bytes and track the job so the back-press recovery
+        // dialog can offer a retry.
+        pendingExports[job.transferId] = job
         Log.i(TAG, "Save cancelled for ${job.transferId}, keeping staged file")
         Toast.makeText(
             this,
@@ -382,34 +448,58 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Back button handling (plan §10):
+     * Uses AndroidX OnBackPressedDispatcher for Android 16+ predictive back gesture support.
      * 1. Dismiss keyboard/IME if open
      * 2. Exit fullscreen if in fullscreen mode
      * 3. If dirty/volatile transfers/pending exports: show Stay/Discard/Cancel
      */
-    override fun onBackPressed() {
-        if (appDirty) {
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("Unsaved changes")
-                .setMessage("You have unsaved changes. Save before closing?")
-                .setPositiveButton("Save") { _, _ ->
-                    // Trigger a save through the host bridge
-                    // Note: no supported host command to trigger Save automatically
-                    Toast.makeText(this, "Use the Save button in PdfCraft before leaving", Toast.LENGTH_LONG).show()
+    private fun setupBackHandling() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (appDirty) {
+                    showUnsavedChangesDialog()
+                } else {
+                    val app = application as PdfCraftApplication
+                    // Merge process-death recovery with jobs staged this session.
+                    val recoverableJobs = LinkedHashMap<String, ExportQueue.ExportJob>()
+                    recoverableJobs.putAll(app.getRecoverableJobs())
+                    recoverableJobs.putAll(pendingExports)
+                    if (recoverableJobs.isNotEmpty()) {
+                        showPendingExportsDialog(recoverableJobs)
+                    } else {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
                 }
-                .setNegativeButton("Discard", null)
-                .setNeutralButton("Cancel", null)
-                .show()
-            return
-        }
-        super.onBackPressed()
+            }
+        })
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
-            onBackPressed()
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
+    private fun showUnsavedChangesDialog() {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Unsaved changes")
+            .setMessage("You have unsaved changes. Save before closing?")
+            .setPositiveButton("Save") { _, _ ->
+                Toast.makeText(this, "Use the Save button in PdfCraft before leaving", Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("Discard") { _, _ -> finish() }
+            .setNeutralButton("Cancel", null)
+            .show()
+    }
+
+    private fun showPendingExportsDialog(jobs: Map<String, ExportQueue.ExportJob>) {
+        val names = jobs.values.map { it.name }.toTypedArray()
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Pending exports")
+            .setItems(names) { _, which ->
+                val job = jobs.values.elementAt(which)
+                requestSaveDestination(job)
+            }
+            .setNegativeButton("Discard all") { _, _ ->
+                jobs.values.forEach { job -> removeStagedExport(job) }
+                finish()
+            }
+            .show()
     }
 
     private fun showErrorSurface(message: String, canRetry: Boolean) {

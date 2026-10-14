@@ -24,10 +24,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Release signing must be configured with a keystore.
+            // See signingConfigs below and proguard-rules.pro for details.
         }
         debug {
             // Debug build uses a separate application ID suffix for coexistence
-            // with release builds (plan §14: debug and release signing keys differ)
+            // with release builds (debug and release signing keys differ)
             applicationIdSuffix = ".debug"
             isDebuggable = true
         }
@@ -62,6 +64,23 @@ android {
             )
         }
     }
+
+    lint {
+        xmlReport = true
+        htmlReport = true
+        abortOnError = true
+        warningsAsErrors = false
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            all {
+                // Pass via Gradle properties for CI flexibility
+                it.jvmArgs("-Xmx2g")
+            }
+        }
+    }
 }
 
 dependencies {
@@ -71,7 +90,8 @@ dependencies {
     implementation(libs.androidx.window)
     implementation(libs.material)
 
-    testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.2.1")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.espresso.core)
 }
