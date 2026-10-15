@@ -44,6 +44,10 @@ class HostMessageBridge(
         fun onAppReady(version: String)
         fun onDirtyChanged(dirty: Boolean)
         fun onAppFailed(error: String)
+        /** host.js refused/failed a transfer but RETAINED it (oversize, queue-full, ack timeout, native reject). */
+        fun onSaveFailed(transferId: String, name: String, reason: String, error: String?)
+        /** host.js still holds queued/active/retained transfers not yet staged natively. */
+        fun onPendingWork(queued: Int, active: Int, failed: Int, queuedBytes: Long)
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -209,6 +213,25 @@ class HostMessageBridge(
                     callback.onSaveCompleted(transferId, false, "Invalid blob download payload")
                 }
             }
+
+            "host:saveFailed" -> {
+                // host.js retained the payload and is asking Android to surface a retry path.
+                callback.onSaveFailed(
+                    json.optString("transferId", ""),
+                    json.optString("name", "document.pdf"),
+                    json.optString("reason", "unknown"),
+                    json.optString("error", "").takeIf { it.isNotBlank() }
+                )
+            }
+
+            "host:pendingWork" -> {
+                callback.onPendingWork(
+                    json.optInt("queued", 0),
+                    json.optInt("active", 0),
+                    json.optInt("failed", 0),
+                    json.optLong("queuedBytes", 0L)
+                )
+            }
         }
     }
 
@@ -364,6 +387,23 @@ class HostMessageBridge(
     }
 
     fun hasInFlightTransfers(): Boolean = exportQueue.hasInFlightTransfers()
+
+    /** Ask host.js to re-send a retained export under a fresh transfer id. */
+    fun sendRetryExport(transferId: String) {
+        sendToHost(JSONObject().apply {
+            put("type", "host:retryExport")
+            put("transferId", transferId)
+        }.toString())
+    }
+
+    /** Tell host.js to drop a retained export the user chose to discard. */
+    fun sendDiscardExport(transferId: String) {
+        sendToHost(JSONObject().apply {
+            put("type", "host:discardExport")
+            put("transferId", transferId)
+        }.toString())
+    }
+
     fun isAppReady(): Boolean = appReady
     fun getAppVersion(): String? = appVersion
 

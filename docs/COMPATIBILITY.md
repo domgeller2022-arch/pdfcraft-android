@@ -6,13 +6,18 @@
 
 This document records the exact behavioral and architectural differences between the native desktop build of PdfCraft, its WebAssembly (`pdfcraft-web`) target, and the Android wrapper (`pdfcraft-android`), under the strict zero-upstream-change requirement.
 
+> **Status labels:** "Supported" / "Implemented" describe the wrapper's design intent and code paths.
+> They are **not** a claim of verified device behaviour. Physical Galaxy Z Fold7 verification is
+> **pending** (see `docs/FOLD7-TEST-REPORT.md`), and rows depending on unverified device behaviour
+> are labelled accordingly.
+
 ## 1. Feature Support Summary
 
 | Feature / Workflow | Desktop Target | Web (`pdfcraft-web`) & Android Wrapper | Notes & Limitations |
 | :--- | :--- | :--- | :--- |
 | **Viewing, Zoom, Pan, Bookmarks, Layers, Attachments** | Supported | **Supported** | Uses `eframe::Renderer::Glow` (WebGL2) inside the hardware-accelerated Android `WebView`. |
 | **Page Operations (Merge, Split, Rotate, Reorder, Extract, Delete)** | Supported | **Supported** | Split/Extract outputs emit Blob downloads captured by `download-adapter.js` and routed through `ExportQueue`. |
-| **Annotations, Comments, Highlights, Shapes, Freehand Ink** | Supported | **Supported** | Finger touch input works on both Galaxy Z Fold7 displays. Note: Galaxy Z Fold7 hardware does not support S Pen. |
+| **Annotations, Comments, Highlights, Shapes, Freehand Ink** | Supported | **Implemented (device-unverified)** | Finger-touch input is implemented through the WebGL canvas; behaviour on the 6.5" cover and 8.0" inner displays is **not yet physically verified**. Galaxy Z Fold7 hardware has no S Pen. |
 | **Form Filling & Finger-Drawn Fill & Sign** | Supported | **Supported** | Standard interactive PDF forms and drawn signatures (`signature.png`) are preserved. |
 | **Password Protection & Encryption** | Supported | **Supported** | Handled inside the original Rust PDF engine in WebAssembly. |
 | **In-App File Pickers (Open, Combine, Insert, Image Import)** | Native OS dialog | **Supported via SAF** | Routed through `PdfCraftChromeClient.onShowFileChooser` with file-extension (`.pdf`, `.png`, `.jpg`, `.txt`, `.json`, `.xfdf`) to MIME normalization. |
@@ -24,7 +29,7 @@ This document records the exact behavioral and architectural differences between
 | **OCR (`.rten` Text Recognition Models)** | Filesystem model loading | **Unsupported in WASM** | `crates/ocr/src/lib.rs` loads `.rten` models via native filesystem paths rather than browser `fetch`. Supporting OCR on Android would require modifying upstream Rust code. |
 | **Certificate / Digital-ID Signing (`.p12` / `.pfx` OS Store)** | Desktop certificate store | **WASM Exclusions Apply** | `crates/ui-egui/src/sign_ui.rs` excludes desktop certificate-store browsing on `wasm32`. Visual Fill & Sign works normally. |
 | **Direct OS Printer Spooling** | Native OS print spooler | **Export-First ("Save as PDF")** | The WASM target has no direct OS print spooler; its Print action produces a print-ready PDF download captured by the Android export queue, which can then be printed or shared via Android's Share sheet. |
-| **Embedded Fonts** | Full desktop font pack | **WASM Subset (`craft-fonts`)** | Preserves the upstream WASM font subset (`Noto Sans CJK SC`, `Noto Sans Arabic`, standard base fonts) to keep the WASM binary size manageable (~41 MB). |
+| **Embedded Fonts** | Full desktop font pack | **WASM Subset (`craft-fonts`)** | The pinned `craft-fonts` WASM recipe (`WEB_FONTS`) embeds **only `BIZ UDPGothic Regular` (~4.5 MB)**; **Noto CJK is excluded** from the WASM build (all four faces are ~24 MB, over typical hosting limits). `NotoSansArabic` / `NotoSansCJKsc` remain in the `craft-fonts` manifest for desktop use only. See `craft-fonts/docs/integration.md`. |
 
 ## 2. Galaxy Z Fold7 Display & Continuity Notes
 

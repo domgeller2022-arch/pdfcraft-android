@@ -74,6 +74,13 @@ class MainActivity : ComponentActivity() {
     data class PendingImport(val name: String, val bytes: ByteArray)
 
     // ActivityResultLauncher for save destination picker.
+    // host.js-side pending work (queued + active) and retained-but-unsent exports.
+    @Volatile private var hostQueuedExports = 0
+    @Volatile private var hostFailedExports = 0
+    // Transfer id of the last job this Activity launched a picker for, so onResume can
+    // pick up a job deferred by a finishing Activity without double-launching.
+    private var lastPickerLaunchedFor: String? = null
+
     // Resolves the active ExportJob from the durable ExportQueue so Activity recreation
     // or process death while DocumentsUI is open never orphans the returned URI.
     private val saveDestinationLauncher: ActivityResultLauncher<Intent> =
@@ -217,6 +224,14 @@ class MainActivity : ComponentActivity() {
             callback = object : HostMessageBridge.BridgeCallback {
                 override fun onSaveStaged(transferId: String, job: ExportQueue.ExportJob) {
                     runOnUiThread {
+                        // Never acquire the durable picker slot from an Activity that is
+                        // being torn down: a late callback would launch an unregistered
+                        // launcher. The job is already persisted in ExportQueue, and the
+                        // recreated Activity picks it up in onResume().
+                        if (isFinishing || isDestroyed) {
+                            Log.i(TAG, "Staged ${job.transferId} while Activity is finishing; deferring picker")
+                            return@runOnUiThread
+                        }
                         requestSaveDestination(job)
                     }
                 }
@@ -242,6 +257,32 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                }
+
+                override fun onSaveFailed(transferId: String, name: String, reason: String, error: String?) {
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle("Export needs attention")
+                            .setMessage(
+                                "\"$name\" could not be handed to the app ($reason).\n\n" +
+                                    (error ?: "") +
+                                    "\n\nThe payload is retained in the editor so you can retry or discard it."
+                            )
+                            .setPositiveButton("Retry") { _, _ ->
+                                messageBridge?.sendRetryExport(transferId)
+                            }
+                            .setNegativeButton("Discard") { _, _ ->
+                                messageBridge?.sendDiscardExport(transferId)
+                            }
+                            .setNeutralButton("Later", null)
+                            .show()
+                    }
+                }
+
+                override fun onPendingWork(queued: Int, active: Int, failed: Int, queuedBytes: Long) {
+                    hostQueuedExports = queued + active
+                    hostFailedExports = failed
                 }
 
                 override fun onImportRequested() {}
@@ -409,7 +450,13 @@ class MainActivity : ComponentActivity() {
 
     private fun requestSaveDestination(job: ExportQueue.ExportJob) {
         val app = application as PdfCraftApplication
-        if (app.exportQueue.acquireOrEnqueuePicker(job)) {
+        val shouldLaunch = app.exportQueue.acquireOrEnqueuePicker(job)
+        if (app.exportQueue.didPickerStatePersistFail()) {
+            // Best-effort persistence: recovery still works from job metadata, but the
+            // failure is surfaced rather than silently ignored.
+            Log.w(TAG, "Picker state could not be persisted; recovery relies on job metadata")
+        }
+        if (shouldLaunch) {
             showSaveDestinationPicker(job)
         }
     }
@@ -430,6 +477,7 @@ class MainActivity : ComponentActivity() {
         }
 
         try {
+            lastPickerLaunchedFor = job.transferId
             saveDestinationLauncher.launch(createFileIntent)
         } catch (e: Exception) {
             Log.e(TAG, "Unable to launch destination picker: ${e.message}", e)
@@ -618,6 +666,21 @@ class MainActivity : ComponentActivity() {
         webView.resumeTimers()
         updateStatusBarAppearance(resources.configuration)
         ViewCompat.requestApplyInsets(webView)
+        resumeDeferredPickerIfNeeded()
+    }
+
+    /**
+     * If a staging callback was deferred because the previous Activity was finishing,
+     * or a picker job survived recreation/process death, launch the destination picker
+     * for the durable active job exactly once in THIS Activity.
+     */
+    private fun resumeDeferredPickerIfNeeded() {
+        if (isFinishing || isDestroyed) return
+        val app = application as PdfCraftApplication
+        val active = app.exportQueue.getActivePickerJob() ?: return
+        if (active.transferId == lastPickerLaunchedFor) return
+        lastPickerLaunchedFor = active.transferId
+        showSaveDestinationPicker(active)
     }
 
     override fun onDestroy() {
@@ -638,13 +701,22 @@ class MainActivity : ComponentActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val hasInFlight = messageBridge?.hasInFlightTransfers() == true
-                if (hasInFlight) {
+                // Also block when host.js still holds queued/active transfers that have
+                // not reached native staging yet — otherwise their bytes are lost.
+                if (hasInFlight || hostQueuedExports > 0) {
                     Toast.makeText(
                         this@MainActivity,
-                        "An export transfer is currently finishing—please wait a moment.",
+                        "An export is still being sent to the app — please wait a moment.",
                         Toast.LENGTH_SHORT
                     ).show()
                     return
+                }
+                if (hostFailedExports > 0) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "$hostFailedExports export(s) need attention in Pending exports.",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
                 if (appDirty) {
                     showUnsavedChangesDialog()

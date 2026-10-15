@@ -200,7 +200,9 @@ object DocumentIo {
             FileOutputStream(tmp).use { out ->
                 out.write(data)
                 out.flush()
-                runCatching { out.fd.sync() }
+                // Propagate sync failure: an unsynced temp file must not be treated as
+                // durably written, so the atomic move is skipped and the error surfaces.
+                out.fd.sync()
             }
             moveAtomically(tmp, target)
         } finally {

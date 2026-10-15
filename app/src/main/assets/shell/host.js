@@ -15,20 +15,34 @@
     const ASSET_ORIGIN = "https://appassets.androidplatform.net";
     const CHUNK_SIZE = 256 * 1024; // 256 KiB per plan §5
     const MAX_IMPORT_BYTES = 100 * 1024 * 1024; // 100 MiB phone-safe import ceiling
-    const MAX_EXPORT_BYTES = 512 * 1024 * 1024; // 512 MiB staging ceiling
     const MAX_CONCURRENT_IMPORTS = 4;
-    const MAX_QUEUED_EXPORTS = 8;
-    const TRANSFER_TIMEOUT_MS = 60000; // 60s timeout for incomplete chunked transfers
-    const CHUNK_ACK_FALLBACK_MS = 150; // Fallback timer when running in test harnesses without native acks
+    const TRANSFER_TIMEOUT_MS = 60000; // 60s timeout for incomplete chunked imports
+
+    // Tunable transfer limits. maxExportBytes is aligned with the native
+    // ExportQueue.MAX_STAGING_BYTES (256 MiB); an export above any limit is refused
+    // AND retained for retry rather than silently dropped.
+    const config = {
+        maxExportBytes: 256 * 1024 * 1024,
+        maxQueuedExportBytes: 256 * 1024 * 1024,
+        // Receiver-controlled backpressure: if the native host does not acknowledge a
+        // chunk within this window, the transfer fails, is retained, and is surfaced.
+        ackTimeoutMs: 30000
+    };
 
     const frame = document.getElementById("pdfcraft-frame");
     let appReady = false;
     let pendingImports = [];
     let importChunks = new Map(); // transferId -> {name, chunks[], expectedSeq, receivedBytes, totalBytes, totalChunks, expectedSha256, startedAt}
 
-    // Outbound chunked export backpressure queue
+    // Outbound chunked export backpressure queue.
+    // Bounded by total bytes (not an arbitrary job count) so a batch of modest
+    // multi-chunk exports is never silently dropped.
     let outboundExports = [];
     let activeOutbound = null;
+    let queuedOutboundBytes = 0;
+    // Exports that could not be queued/sent (oversize, byte-bound exceeded, ack timeout,
+    // native reject). Retained in memory so the user can retry, and surfaced to Android.
+    const failedExports = new Map(); // transferId -> {name, saveAs, mimeType, buffer, reason}
 
     // Monotonic counter for save IDs — avoids Date.now() collisions when multiple
     // saves happen in the same millisecond.
@@ -125,6 +139,14 @@
 
             case "host:saveChunkAck":
                 handleSaveChunkAck(data.transferId, data.seq, data.success, data.error);
+                break;
+
+            case "host:retryExport":
+                retryFailedExport(data.transferId);
+                break;
+
+            case "host:discardExport":
+                discardFailedExport(data.transferId);
                 break;
 
             case "host:saveResult":
@@ -375,8 +397,10 @@
     }
 
     function transferBytesToNative(id, name, saveAs, mimeType, buffer, singleMessageType) {
-        if (buffer.byteLength > MAX_EXPORT_BYTES) {
-            console.error("Export exceeds MAX_EXPORT_BYTES:", buffer.byteLength);
+        if (buffer.byteLength > config.maxExportBytes) {
+            retainFailedExport(id, name, saveAs, mimeType, buffer, "oversize",
+                "Export is larger than the " + Math.round(config.maxExportBytes / (1024 * 1024)) +
+                " MiB device limit");
             return;
         }
         const senderSha256 = sha256Hex(buffer);
@@ -393,49 +417,87 @@
                 sha256: senderSha256,
                 bytes: arrayBufferToBase64(buffer)
             });
-        } else {
-            if (outboundExports.length >= MAX_QUEUED_EXPORTS) {
-                console.error("Outbound export queue full; dropping transfer:", id);
-                return;
-            }
-            const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
-            outboundExports.push({
-                transferId: id,
-                name: name,
-                saveAs: saveAs,
-                mimeType: mimeType,
-                buffer: buffer,
-                totalBytes: buffer.byteLength,
-                totalChunks: totalChunks,
-                sha256: senderSha256,
-                nextSeq: 0,
-                ackTimer: null,
-                startedAt: Date.now()
-            });
-            if (!activeOutbound) {
-                pumpNextOutboundTransfer();
-            }
+            return;
         }
+
+        if (queuedOutboundBytes + buffer.byteLength > config.maxQueuedExportBytes) {
+            retainFailedExport(id, name, saveAs, mimeType, buffer, "queue-full",
+                "Too many exports are already waiting; this one was retained so you can retry it");
+            return;
+        }
+
+        const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+        outboundExports.push({
+            transferId: id,
+            name: name,
+            saveAs: saveAs,
+            mimeType: mimeType,
+            buffer: buffer,
+            totalBytes: buffer.byteLength,
+            totalChunks: totalChunks,
+            sha256: senderSha256,
+            nextSeq: 0,
+            ackTimer: null
+        });
+        queuedOutboundBytes += buffer.byteLength;
+        notifyPendingWork();
+        if (!activeOutbound) {
+            pumpNextOutboundTransfer();
+        }
+    }
+
+    // Retain a refused/failed export and let Android surface a visible retry workflow.
+    // Nothing is dropped silently: every refusal produces a host:saveFailed message.
+    function retainFailedExport(id, name, saveAs, mimeType, buffer, reason, message) {
+        failedExports.set(id, {
+            transferId: id, name: name, saveAs: saveAs, mimeType: mimeType, buffer: buffer, reason: reason
+        });
+        console.error("Export retained for retry:", id, reason, "-", message);
+        sendToNative({
+            type: "host:saveFailed",
+            transferId: id,
+            name: name,
+            reason: reason,
+            error: message
+        });
+        notifyPendingWork();
+    }
+
+    // Report host-side pending work (waiting + active + retained) so the Android exit
+    // policy can account for transfers that have not reached native staging yet.
+    function notifyPendingWork() {
+        sendToNative({
+            type: "host:pendingWork",
+            queued: outboundExports.length,
+            active: activeOutbound ? 1 : 0,
+            failed: failedExports.size,
+            queuedBytes: queuedOutboundBytes
+        });
+    }
+
+    function getPendingWork() {
+        return {
+            queued: outboundExports.length,
+            active: activeOutbound ? 1 : 0,
+            failed: failedExports.size,
+            queuedBytes: queuedOutboundBytes
+        };
     }
 
     function pumpNextOutboundTransfer() {
         if (activeOutbound) return;
         activeOutbound = outboundExports.shift() || null;
-        if (!activeOutbound) return;
+        if (!activeOutbound) {
+            notifyPendingWork();
+            return;
+        }
+        queuedOutboundBytes = Math.max(0, queuedOutboundBytes - activeOutbound.totalBytes);
         sendCurrentOutboundChunk();
     }
 
     function sendCurrentOutboundChunk() {
         if (!activeOutbound) return;
         const tx = activeOutbound;
-        if (Date.now() - tx.startedAt > TRANSFER_TIMEOUT_MS) {
-            console.error("Outbound chunked transfer timed out:", tx.transferId);
-            clearOutboundAckTimer(tx);
-            activeOutbound = null;
-            pumpNextOutboundTransfer();
-            return;
-        }
-
         const seq = tx.nextSeq;
         const start = seq * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, tx.totalBytes);
@@ -455,13 +517,15 @@
         });
 
         clearOutboundAckTimer(tx);
-        // Backpressure: wait for native host:saveChunkAck, with a fallback timer so
-        // synchronous or non-acking test harnesses still progress cleanly.
+        // Receiver-controlled backpressure: advance ONLY on a matching native ack.
+        // If none arrives within config.ackTimeoutMs the transfer fails, is retained,
+        // and is surfaced to the user — it never silently advances.
         tx.ackTimer = setTimeout(function () {
             if (activeOutbound === tx && tx.nextSeq === seq) {
-                advanceOutboundChunk(tx.transferId, seq);
+                failOutboundTransfer(tx, "ack-timeout",
+                    "No acknowledgement for chunk " + seq + " within " + config.ackTimeoutMs + " ms");
             }
-        }, CHUNK_ACK_FALLBACK_MS);
+        }, config.ackTimeoutMs);
     }
 
     function clearOutboundAckTimer(tx) {
@@ -471,18 +535,24 @@
         }
     }
 
+    function failOutboundTransfer(tx, reason, message) {
+        clearOutboundAckTimer(tx);
+        if (activeOutbound === tx) activeOutbound = null;
+        retainFailedExport(tx.transferId, tx.name, tx.saveAs, tx.mimeType, tx.buffer, reason, message);
+        pumpNextOutboundTransfer();
+    }
+
     function handleSaveChunkAck(transferId, seq, success, error) {
+        // Only an ack naming the active transfer AND the expected sequence may change state.
         if (!activeOutbound || activeOutbound.transferId !== transferId) return;
+        if (seq !== activeOutbound.nextSeq) return;
         clearOutboundAckTimer(activeOutbound);
         if (success === false) {
-            console.error("Native rejected chunk", seq, "for", transferId, error || "");
-            activeOutbound = null;
-            pumpNextOutboundTransfer();
+            failOutboundTransfer(activeOutbound, "native-reject",
+                "Native rejected chunk " + seq + ": " + (error || ""));
             return;
         }
-        if (seq === activeOutbound.nextSeq) {
-            advanceOutboundChunk(transferId, seq);
-        }
+        advanceOutboundChunk(transferId, seq);
     }
 
     function advanceOutboundChunk(transferId, seq) {
@@ -505,8 +575,24 @@
                 sha256: tx.sha256
             });
             activeOutbound = null;
+            notifyPendingWork();
             pumpNextOutboundTransfer();
         }
+    }
+
+    function retryFailedExport(transferId) {
+        const entry = failedExports.get(transferId);
+        if (!entry) return;
+        failedExports.delete(transferId);
+        // Re-send under a fresh id so native per-transfer staging state starts clean.
+        transferBytesToNative(generateSaveId("retry_"), entry.name, entry.saveAs,
+            entry.mimeType, entry.buffer, "host:save");
+        notifyPendingWork();
+    }
+
+    function discardFailedExport(transferId) {
+        failedExports.delete(transferId);
+        notifyPendingWork();
     }
 
     function handleSaveToNative(data) {
@@ -650,6 +736,7 @@
 
     window.PdfCraftHost = {
         ASSET_ORIGIN: ASSET_ORIGIN,
+        config: config,
         sendToNative: sendToNative,
         handleSave: handleSaveToNative,
         handleBlobDownload: handleBlobDownloadFromIframe,
@@ -657,6 +744,9 @@
         flushQueuedImports: flushQueuedImports,
         generateSaveId: generateSaveId,
         toArrayBuffer: toArrayBuffer,
-        sha256Hex: sha256Hex
+        sha256Hex: sha256Hex,
+        retryFailedExport: retryFailedExport,
+        discardFailedExport: discardFailedExport,
+        getPendingWork: getPendingWork
     };
 })();

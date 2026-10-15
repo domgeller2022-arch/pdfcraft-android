@@ -412,7 +412,9 @@ class ExportQueue(
             out.write(data)
             if (seq + 1 == totalChunks) {
                 out.flush()
-                runCatching { out.fd.sync() }
+                // Propagate sync failure: an unsynced final chunk must not be finalized
+                // as durable. The caller converts the IOException into a visible error.
+                out.fd.sync()
             }
         }
 
@@ -574,15 +576,33 @@ class ExportQueue(
     @Synchronized
     fun getQueuedPickerIds(): List<String> = pickerQueueIds.toList()
 
+    @Volatile
+    private var pickerStatePersistFailed = false
+
+    /**
+     * True if the most recent picker-state write failed. Picker association is a
+     * best-effort persistence (also recoverable from job metadata), so failures are
+     * recorded and surfaced to the user rather than silently swallowed.
+     */
+    fun didPickerStatePersistFail(): Boolean = pickerStatePersistFailed
+
     @Synchronized
-    private fun savePickerState() {
+    private fun savePickerState(): Boolean {
         metadataDir.mkdirs()
         val file = File(metadataDir, PICKER_STATE_FILE)
         val content = buildString {
             append("active=").append(activePickerJobId.orEmpty()).append('\n')
             append("queue=").append(pickerQueueIds.joinToString(","))
         }
-        runCatching { DocumentIo.writeAtomically(file, content.toByteArray(Charsets.UTF_8)) }
+        return try {
+            DocumentIo.writeAtomically(file, content.toByteArray(Charsets.UTF_8))
+            pickerStatePersistFailed = false
+            true
+        } catch (e: Exception) {
+            pickerStatePersistFailed = true
+            Log.e(TAG, "Failed to persist picker state: ${e.message}", e)
+            false
+        }
     }
 
     @Synchronized
