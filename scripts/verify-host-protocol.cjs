@@ -199,6 +199,29 @@ async function main() {
     assert.equal(ctx.window.PdfCraftHost.getPendingWork().failed, 0, 'retry cleared the failed entry');
   });
 
+  await check('FAILED-BUFFER LIMIT: exhausted retry memory is surfaced without a false retry promise', () => {
+    const { ctx } = makeHost();
+    ctx.window.PdfCraftHost.config.maxExportBytes = 2;
+    ctx.window.PdfCraftHost.config.maxRetainedExportBytes = 5;
+    ctx.fromIframe({ type: 'pdfcraft:save', name: 'retained.pdf', saveAs: true, bytes: ctx.makeBuf([1, 2, 3]) });
+    ctx.fromIframe({ type: 'pdfcraft:save', name: 'not-retained.pdf', saveAs: true, bytes: ctx.makeBuf([4, 5, 6]) });
+    const failures = ctx.find('host:saveFailed');
+    assert.equal(failures.length, 2);
+    assert.equal(failures[0].retained, true);
+    assert.equal(failures[1].retained, false);
+    assert.match(failures[1].error, /Keep the document open/);
+    assert.equal(ctx.window.PdfCraftHost.getPendingWork().failed, 2, 'both failures must protect against silent exit');
+    ctx.fromNative({type: 'host:reviewFailedExport'});
+    assert.equal(ctx.find('host:saveFailed').length, 3, 'Later failures can be reviewed again');
+    ctx.window.PdfCraftHost.discardFailedExport(failures[0].transferId);
+    ctx.fromNative({type: 'host:reviewFailedExport'});
+    assert.equal(ctx.find('host:saveFailed')[3].retained, false);
+    ctx.window.PdfCraftHost.retryFailedExport(failures[1].transferId);
+    assert.equal(ctx.window.PdfCraftHost.getPendingWork().failed, 1, 'retry cannot erase a non-retained failure record');
+    ctx.window.PdfCraftHost.discardFailedExport(failures[1].transferId);
+    assert.equal(ctx.window.PdfCraftHost.getPendingWork().failed, 0);
+  });
+
   console.log('');
   console.log(failures === 0 ? 'ALL PROTOCOL CHECKS PASSED.' : failures + ' CHECK(S) FAILED.');
   process.exit(failures === 0 ? 0 : 1);

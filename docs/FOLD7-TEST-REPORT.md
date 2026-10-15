@@ -1,50 +1,40 @@
-# PdfCraft on Android: Galaxy Z Fold7 Test Report
+# Consolidated Fold7 verification report
 
-**Date:** 2026-10-15
-**Target device:** Samsung Galaxy Z Fold7 (SM-F956U) — **not physically tested**
-**Android:** 16 (API 36) target
-**Baseline Commit Audited:** `c285ad4074d89eca247c69a46175417adaf348b6`
+Prepared 2026-10-16. This report supersedes test-status claims in the earlier replacement guides. The canonical application instructions are in `FOLD7-COMPLETE-FIX.md`.
 
-> Status legend: **PASS** = verified by automated test, static verification, or command;
-> **PENDING** = requires physical Galaxy Z Fold7 device or Android instrumentation execution;
-> **FAIL** = attempted and did not pass.
+## Baseline and source scope
 
-## 1. Build & Verification Summary
+- Android baseline: `511793178132937757064e34cad09ab9a21fbc3a`.
+- PDFCraft source: `bbbe60015c571ebfc39708ee07777b89e267122a` plus `patches/pdfcraft-fold7.patch`.
+- craft-fonts input: `8dcdacd5153e64560d109541a47d806f26f048c0`.
+- This implementation did not edit the original source repositories. Unrelated documentation edits appeared in the original upstream checkout during verification and were preserved. The build uses a separate clean pinned checkout; the phone changes live in the supplied patch and isolated build copy.
+- Android version: `1.0.1-fold7` (code 2); debug application ID: `com.domgeller.pdfcraft.debug`.
 
-| Check | Status | Evidence |
-|-------|--------|----------|
-| Bundled web asset SRI (`sha384`) | **PASS** | `index.html` integrity hashes match `pdfcraft-web-662b253c51788020.js` and `_bg.wasm` |
-| `verifyAndSyncWebAssets` Gradle gate | **PASS** | Pre-build task verifies `index.html`, `.js`, `.wasm`, and SHA-384 integrity before packaging |
-| JS syntax & protocol harness (`node`) | **PASS** | `scripts/verify-host-protocol.cjs` verifies duplicate-chunk rejection (`seq=0` twice), 4-byte view over 6-byte buffer slicing, SHA-256 vs Node crypto, chunked exports, and `host:saveChunkAck` backpressure |
-| `ExportQueueTest` (16 Robolectric tests) | **PASS** | Covers staging, sender SHA-256 verification, chunked disk streaming, duplicate/out-of-order/metadata/concurrency guards, orphan stage-file reconciliation, picker state persistence across recreation, and MIME persistence |
-| Startup asset lookup on device | **PENDING** | Needs physical Fold7 launch to confirm |
-| Open → edit → Save → reopen | **PENDING** | Device testing not yet performed |
-| Fold/unfold & picker recreation continuity | **PENDING** | Device testing not yet performed |
-| Split/export capture & Share | **PENDING** | Device testing not yet performed |
+## Automated checks
 
-## 2. Post-`c285ad4` Audit & Supplement Remediations
+| Check | Result |
+|---|---|
+| Android unit and lifecycle regressions | PASS: 25 tests, 0 failures, 0 skipped |
+| Host protocol harness | PASS: 10 checks |
+| Retry protocol harness | PASS: fresh transfer IDs, stale ACK rejection, pending-work notification |
+| Rust WASM source check | Preliminary release-target check passed; final-source compilation is covered by the optimized build below |
+| Final optimized web build | PASS: release WASM with locked inputs and final phone patch |
+| Native touch/layout regressions | PASS: 4/4 on final source, including draft retention through panel open/close |
+| Rotate/extract dialog regression | PASS on final source |
+| Existing editing suite | 83/84 passed before the final dialog correction; the failing rotate/extract case then passed individually. The full suite was not repeated after that correction. |
+| Android lint | PASS: 0 errors, 36 warnings (24 unused-resource warnings, 3 dependency-version notices and 9 API/configuration/UI suggestions; see XML report) |
+| APK build with provenance guard enabled | PASS: assembleDebug, guard enabled |
+| Complete patch applies to baseline | PASS: clean Android 5117931 checkout |
+| APK asset/provenance comparison | PASS: exact web asset bytes, provenance and packaged notices; debug signature verified |
 
-| # | Area | Defect in `c285ad4` | Fix Applied |
-|---|------|---------------------|-------------|
-| 1 | Transfer protocol & flow control (`host.js`, `HostMessageBridge.kt`, `ExportQueue.kt`) | Missing duplicate/missing/out-of-range chunk checks, metadata consistency checks, sender checksums, timeouts, concurrency caps, and backpressure (sending chunk 0 twice triggered early import assembly and threw on `undefined`) | Added synchronous FIPS 180-4 SHA-256 sender checksums on imports and exports, strict sequential `seq == expectedSeq` & metadata validation, concurrency & 60s timeout bounds, and per-chunk `host:saveChunkAck` backpressure |
-| 2 | Typed-array view slicing (`host.js`) | `toArrayBuffer` returned `input.buffer` without slicing `[byteOffset, byteOffset + byteLength]`, exporting a 6-byte backing buffer for a 4-byte view | Sliced non-zero offset or partial-length `ArrayBuffer.isView` inputs to their exact range |
-| 3 | Phone-safe import limits (`DocumentIo.kt`) | `readBytes` grew `ByteArrayOutputStream` without a bound before the 2 GiB staging check | Added a 100 MiB phone-safe import cap (`MAX_IMPORT_BYTES`), advisory `OpenableColumns.SIZE` pre-check, streaming enforcement, and `OutOfMemoryError` guard |
-| 4 | Crash-safe metadata & orphan recovery (`ExportQueue.kt`, `DocumentIo.kt`) | `.job` metadata used direct `writeText`; stage-file fallback wrote in place; crash between staging PDF and committing `.job` left an unrecoverable orphan PDF | Used NIO `Files.move(..., REPLACE_EXISTING, ATOMIC_MOVE)` after `fd.sync()` for all stage and metadata writes; added orphan stage-file reconciliation in `recoverPendingExports` |
-| 5 | Picker state across Activity recreation (`MainActivity.kt`, `ExportQueue.kt`, `PdfCraftApplication.kt`) | `currentExportJob` and `pickerQueue` lived only in Activity memory; Activity recreation while `ACTION_CREATE_DOCUMENT` was open lost the job association; `ioExecutor` was tied to Activity | Persisted active picker job ID and queue in `ExportQueue` (`picker_state.prop`) + `onSaveInstanceState`; moved `ioExecutor` to `PdfCraftApplication` |
-| 6 | Visible write/verify errors (`DocumentIo.kt`, `MainActivity.kt`) | Write exceptions only logged and posted `host:saveResult` to console; unreadable output providers were conflated with corrupt writes | Added 3-state `VerificationResult` (`VERIFIED`, `UNAVAILABLE`, `MISMATCH`) and visible recovery `AlertDialog`s (`Save / Share / Keep / Discard`) on all write/stage failures |
-| 7 | In-app file picker (`PdfCraftChromeClient.kt`) | Raw file extensions (`.pdf`, `.png`, `.json`, `.xfdf`) were passed into `Intent.EXTRA_MIME_TYPES`; replacing `uploadCallback` leaked the previous callback | Normalized extensions and comma-separated lists into valid MIME types; completed any superseded `uploadCallback` with `null` |
-| 8 | Bridge UI-thread delivery (`MainActivity.kt`, `HostMessageBridge.kt`) | `onAppReady` called `WebViewCompat.postWebMessage` on `ioExecutor` (caught and logged by `handleMessage`, losing the incoming intent import) | Wrapped `onAppReady` and `onDirtyChanged` in `runOnUiThread`; enforced main-Looper delivery in `HostMessageBridge.sendToHost` |
-| 9 | Fold7 lifecycle & insets (`MainActivity.kt`) | `onPause()` called `webView.pauseTimers()`; `applyWindowInsets` added `systemBars + displayCutout`; `onRenderProcessGone` and startup timeout were absent | Removed `pauseTimers()` from `onPause()`, installed union `OnApplyWindowInsetsListener`, synced dark-mode status bar icons, and added `onRenderProcessGone` + 25s startup watchdog |
-| 10 | Build scripts & docs (`scripts/`, `app/build.gradle.kts`, `docs/COMPATIBILITY.md`) | `scripts/build-web.sh` resolved `WORKSPACE` to `pdfcraft-android/`; scripts had hardcoded `/Users/dd/...` paths; `COMPATIBILITY.md` was missing | Fixed sibling path resolution, removed hardcoded paths, added `verifyAndSyncWebAssets` Gradle task, and authored `docs/COMPATIBILITY.md` |
+Android regressions include required data/metadata sync failures, orphan recovery, restored picker fallback, stale Activity-owner teardown, a real simulated Activity destroy/recreate during delayed export completion, and explicit review/leave handling for host-only failed exports. Robolectric exercises Android lifecycle logic; it does not simulate Samsung WebView rendering or a physical keyboard.
 
-## 3. Acceptance Gate (Pending Physical Galaxy Z Fold7 Verification)
+The protocol checks cover delayed/missing ACKs, ten multi-chunk exports, overflow retention, failed-buffer memory limits, metadata-only failure review/discard and stale retry messages. They use an isolated JavaScript harness; they do not replace Android document-provider tests.
 
-Unit tests (`ExportQueueTest`) and Node.js protocol tests verify component logic on the JVM/V8, but do **not** replace physical device verification. Before release sign-off, verify on the physical Galaxy Z Fold7:
-1. Cold startup in airplane mode on cover (6.5") and inner (8.0") displays.
-2. Original in-app file chooser workflows (Open, Combine, Insert, image import).
-3. Incoming Android `ACTION_VIEW` ("Open With") and `ACTION_SEND` ("Share") intents.
-4. Save → destination picker → independent SHA-256 verification → reopen.
-5. Non-PDF (`.csv`, `.png`, `.xfdf`, `.txt`) and multi-megabyte chunked Blob exports.
-6. Picker cancellation, Activity recreation while Open/Save pickers are on screen, and process-death restart recovery.
-7. Malformed transfer rejection and provider write-failure recovery dialogs.
-8. Repeated fold/unfold, rotation, split-screen, and IME transitions with unsaved edits.
+No additional broad test, Clippy or graphics-rendering runs were started after the request to finish promptly. The passing mobile tests inspect real egui interaction and geometry headlessly; no simulated phone image is presented as physical-device proof.
+
+## Required device acceptance
+
+**Physical Galaxy Z Fold7 testing has not been performed by this audit.** The user's specific PDF was not supplied. Run the checklist in `FOLD7-COMPLETE-FIX.md` on the installed new APK, including existing paragraph edits over background images, Done/Cancel, formatting, the cover-screen keyboard, inner/outer transitions, save/reopen and recovery.
+
+Also verify cold startup in airplane mode, Android Open With/Share imports, non-PDF exports, picker cancellation, split-screen, and both readable and write-only document providers. The APK is debug-signed for testing. Release signing and physical-device acceptance remain separate release steps; no desktop image or passing build is described here as physical-phone proof.

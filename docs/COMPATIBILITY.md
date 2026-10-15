@@ -4,7 +4,7 @@
 **Pinned Font Input (`craft-fonts`):** `8dcdacd5153e64560d109541a47d806f26f048c0`
 **Target Device Baseline:** Samsung Galaxy Z Fold7 (Android 16 / One UI 8, API 36)
 
-This document records the exact behavioral and architectural differences between the native desktop build of PdfCraft, its WebAssembly (`pdfcraft-web`) target, and the Android wrapper (`pdfcraft-android`), under the strict zero-upstream-change requirement.
+This document records the exact behavioral and architectural differences between the native desktop build of PdfCraft, its WebAssembly (`pdfcraft-web`) target, and the Android wrapper (`pdfcraft-android`), with the consolidated phone patch applied only to a disposable upstream build copy. The original source checkout stays unchanged. See `FOLD7-COMPLETE-FIX.md` for the complete implementation and build instructions.
 
 > **Status labels:** "Supported" / "Implemented" describe the wrapper's design intent and code paths.
 > They are **not** a claim of verified device behaviour. Physical Galaxy Z Fold7 verification is
@@ -29,11 +29,11 @@ This document records the exact behavioral and architectural differences between
 | **OCR (`.rten` Text Recognition Models)** | Filesystem model loading | **Unsupported in WASM** | `crates/ocr/src/lib.rs` loads `.rten` models via native filesystem paths rather than browser `fetch`. Supporting OCR on Android would require modifying upstream Rust code. |
 | **Certificate / Digital-ID Signing (`.p12` / `.pfx` OS Store)** | Desktop certificate store | **WASM Exclusions Apply** | `crates/ui-egui/src/sign_ui.rs` excludes desktop certificate-store browsing on `wasm32`. Visual Fill & Sign works normally. |
 | **Direct OS Printer Spooling** | Native OS print spooler | **Export-First ("Save as PDF")** | The WASM target has no direct OS print spooler; its Print action produces a print-ready PDF download captured by the Android export queue, which can then be printed or shared via Android's Share sheet. |
-| **Embedded Fonts** | Full desktop font pack | **WASM Subset (`craft-fonts`)** | The pinned `craft-fonts` WASM recipe (`WEB_FONTS`) embeds **only `BIZ UDPGothic Regular` (~4.5 MB)**; **Noto CJK is excluded** from the WASM build (all four faces are ~24 MB, over typical hosting limits). `NotoSansArabic` / `NotoSansCJKsc` remain in the `craft-fonts` manifest for desktop use only. See `craft-fonts/docs/integration.md`. |
+| **Embedded Fonts** | Desktop font pack subject to upstream asset policy | **WASM subset (`craft-fonts`)** | The pinned PDFCraft `crates/fonts/build.rs` embeds BIZ UDPGothic Regular plus Arabic/Telugu-script faces present in the font manifest. This pinned manifest contributes BIZ UDPGothic Regular and Noto Sans Arabic Regular. Noto Sans CJK is explicitly barred by upstream asset policy in both targets. The older generic craft-fonts integration recipe is not the authoritative build selection. |
 
 ## 2. Galaxy Z Fold7 Display & Continuity Notes
 
 1. **Both Displays Supported**: The `WebView` fills the usable window on both the 6.5-inch cover display and the 8.0-inch inner display using adaptive window sizing (`resizeableActivity="true"`).
 2. **Fold / Unfold Continuity**: `MainActivity` handles `orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density` in-place so folding, unfolding, rotating, or entering split-screen resizes the `eframe` canvas without reloading the page or losing open tabs.
 3. **Cover Screen Continuation Setting**: On One UI 8, folding the phone closed locks the screen by default unless PdfCraft is enabled under **Settings → Display → Continue apps on cover screen**.
-4. **UI Scale Adjustment**: Because PdfCraft renders its toolbar and dialogs inside a Rust/egui WebGL canvas, users can adjust control sizing on the cover screen using PdfCraft's built-in **Interface size** preference (persisted in `localStorage` under `https://appassets.androidplatform.net`).
+4. **Compact layout**: At widths below 780 or heights below 480 egui logical points, the phone patch uses compact bars and one overlay panel at a time, with bounded editors and scrollable dialogs. At wider widths the existing docking layout is used. There is no forced 780-pixel viewport or whole-interface shrink. Interface zoom preferences can change logical width and therefore the breakpoint.

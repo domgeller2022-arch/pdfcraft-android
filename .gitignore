@@ -11,6 +11,10 @@ local.properties
 # Log files
 *.log
 *.txt
+# Licence texts are distributed with the APK and must be included in patches.
+!app/src/main/assets/notices/**
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store

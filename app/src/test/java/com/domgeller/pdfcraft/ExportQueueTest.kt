@@ -36,6 +36,7 @@ class ExportQueueTest {
 
     @After
     fun tearDown() {
+        DocumentIo.syncDescriptor = { fd -> fd.sync() }
         stagingDir.deleteRecursively()
         metadataDir.deleteRecursively()
     }
@@ -262,4 +263,73 @@ class ExportQueueTest {
         assertFalse(job.stageFile.exists())
         assertFalse(File(metadataDir, "clear_test.job").exists())
     }
+    @Test
+    fun stageExport_propagatesDiskSyncFailure_andDoesNotMoveTempFile() {
+        DocumentIo.syncDescriptor = { _ ->
+            throw IOException("Simulated fsync failure during stageExport")
+        }
+        val ex = assertThrows(IOException::class.java) {
+            queue.stageExport("sync_fail_1", "unsynced.pdf", true, byteArrayOf(0x25, 0x50, 0x44, 0x46))
+        }
+        assertTrue(ex.message?.contains("Simulated fsync failure") == true)
+        assertNull(queue.getJob("sync_fail_1"))
+        assertTrue(stagingDir.listFiles().isNullOrEmpty())
+    }
+
+    @Test
+    fun receiveChunk_propagatesFinalChunkSyncFailure_andDoesNotAdvanceState() {
+        val chunk0 = byteArrayOf(1, 2, 3, 4)
+        val chunk1 = byteArrayOf(5, 6, 7, 8)
+        assertFalse(queue.receiveChunk("chunk_sync_fail", "chunked.pdf", true, 8L, 2, 0, 4, chunk0))
+        assertTrue(queue.hasInFlightTransfers())
+
+        DocumentIo.syncDescriptor = { _ ->
+            throw IOException("Simulated fsync failure on final chunk")
+        }
+        val ex = assertThrows(IOException::class.java) {
+            queue.receiveChunk("chunk_sync_fail", "chunked.pdf", true, 8L, 2, 1, 4, chunk1)
+        }
+        assertTrue(ex.message?.contains("Simulated fsync failure") == true)
+        // Transfer must be aborted and cleaned up rather than advancing to finalize
+        assertFalse(queue.hasInFlightTransfers())
+        assertThrows(IOException::class.java) {
+            queue.finalizeChunkedExport("chunk_sync_fail", "chunked.pdf", true, 8L)
+        }
+    }
+
+    @Test
+    fun acquireOrEnqueuePicker_recordsPickerStatePersistFailureWhenSyncFails() {
+        val job = queue.stageExport("pick_fail_1", "doc.pdf", true, byteArrayOf(1, 2, 3))
+        assertFalse(queue.didPickerStatePersistFail())
+
+        // Let awaitingDestination(.job) succeed, then fail on picker_state.prop write
+        var callCount = 0
+        DocumentIo.syncDescriptor = { fd ->
+            callCount++
+            if (callCount >= 2) {
+                throw IOException("Simulated picker_state.prop fsync failure")
+            }
+            fd.sync()
+        }
+
+        assertTrue(queue.acquireOrEnqueuePicker(job))
+        assertTrue(queue.didPickerStatePersistFail())
+        assertTrue(queue.getLastPickerStatePersistError()?.contains("Simulated picker_state.prop") == true)
+    }
+    @Test fun metadataSyncFailureSurfacesAndLeavesRecoverablePdf() {
+        var syncs = 0
+        DocumentIo.syncDescriptor = { fd ->
+            syncs++
+            if (syncs == 2) throw IOException("Injected job metadata sync failure")
+            fd.sync()
+        }
+        assertThrows(IOException::class.java) {
+            queue.stageExport("metadata_failure", "retained.pdf", true, byteArrayOf(1,2,3))
+        }
+        DocumentIo.syncDescriptor = { fd -> fd.sync() }
+        val restarted = ExportQueue(stagingDir, metadataDir)
+        assertNotNull(restarted.getJob("metadata_failure"))
+        assertTrue(restarted.getJob("metadata_failure")!!.stageFile.exists())
+    }
+
 }

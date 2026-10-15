@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val TAG = "MainActivity"
         private const val STARTUP_READY_TIMEOUT_MS = 25_000L
+        private const val STATE_LAST_PICKER = "last_picker_launched"
         private const val STATE_ACTIVE_PICKER_JOB_ID = "state_active_picker_job_id"
         private const val STATE_QUEUED_PICKER_JOB_IDS = "state_queued_picker_job_ids"
         private const val STATE_STARTUP_PROMPT_SHOWN = "state_startup_prompt_shown"
@@ -85,8 +86,10 @@ class MainActivity : ComponentActivity() {
     // or process death while DocumentsUI is open never orphans the returned URI.
     private val saveDestinationLauncher: ActivityResultLauncher<Intent> =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            lastPickerLaunchedFor = null
             val app = application as PdfCraftApplication
             val (job, nextJob) = app.exportQueue.consumeCurrentAndAdvancePicker()
+            checkPickerStatePersistence()
             if (job != null) {
                 if (result.resultCode == RESULT_OK) {
                     val destUri = result.data?.data
@@ -112,10 +115,12 @@ class MainActivity : ComponentActivity() {
 
         val app = application as PdfCraftApplication
         if (savedInstanceState != null) {
+            lastPickerLaunchedFor = savedInstanceState.getString(STATE_LAST_PICKER)
             startupRecoveryPromptShown = savedInstanceState.getBoolean(STATE_STARTUP_PROMPT_SHOWN, false)
             val savedActiveId = savedInstanceState.getString(STATE_ACTIVE_PICKER_JOB_ID)
             val savedQueuedIds = savedInstanceState.getStringArrayList(STATE_QUEUED_PICKER_JOB_IDS).orEmpty()
             app.exportQueue.restorePickerSelection(savedActiveId, savedQueuedIds)
+            checkPickerStatePersistence()
         }
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -223,17 +228,7 @@ class MainActivity : ComponentActivity() {
             executor = app.ioExecutor,
             callback = object : HostMessageBridge.BridgeCallback {
                 override fun onSaveStaged(transferId: String, job: ExportQueue.ExportJob) {
-                    runOnUiThread {
-                        // Never acquire the durable picker slot from an Activity that is
-                        // being torn down: a late callback would launch an unregistered
-                        // launcher. The job is already persisted in ExportQueue, and the
-                        // recreated Activity picks it up in onResume().
-                        if (isFinishing || isDestroyed) {
-                            Log.i(TAG, "Staged ${job.transferId} while Activity is finishing; deferring picker")
-                            return@runOnUiThread
-                        }
-                        requestSaveDestination(job)
-                    }
+                    app.notifyExportStaged(job)
                 }
 
                 override fun onSaveCompleted(transferId: String, success: Boolean, error: String?) {
@@ -259,9 +254,16 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                override fun onSaveFailed(transferId: String, name: String, reason: String, error: String?) {
+                override fun onSaveFailed(transferId: String, name: String, reason: String, error: String?, retained: Boolean) {
                     runOnUiThread {
                         if (isFinishing || isDestroyed) return@runOnUiThread
+                        if (!retained) {
+                            AlertDialog.Builder(this@MainActivity).setTitle("Export needs attention")
+                                .setMessage("$name: ${error ?: reason}").setPositiveButton("Keep editing", null)
+                                .setNegativeButton("Discard failed export") { _, _ -> messageBridge?.sendDiscardExport(transferId) }
+                                .show()
+                            return@runOnUiThread
+                        }
                         AlertDialog.Builder(this@MainActivity)
                             .setTitle("Export needs attention")
                             .setMessage(
@@ -299,6 +301,7 @@ class MainActivity : ComponentActivity() {
                                 sendImportToIframe(import.name, import.bytes)
                             }
                         }
+                        resumeDeferredPickerIfNeeded()
                         maybePromptRecoveredExportsAtStartup()
                     }
                 }
@@ -330,6 +333,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_LAST_PICKER, lastPickerLaunchedFor)
         super.onSaveInstanceState(outState)
         val app = application as PdfCraftApplication
         outState.putBoolean(STATE_STARTUP_PROMPT_SHOWN, startupRecoveryPromptShown)
@@ -448,22 +452,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestSaveDestination(job: ExportQueue.ExportJob) {
-        val app = application as PdfCraftApplication
-        val shouldLaunch = app.exportQueue.acquireOrEnqueuePicker(job)
-        if (app.exportQueue.didPickerStatePersistFail()) {
-            // Best-effort persistence: recovery still works from job metadata, but the
-            // failure is surfaced rather than silently ignored.
-            Log.w(TAG, "Picker state could not be persisted; recovery relies on job metadata")
+    private fun checkPickerStatePersistence() {
+        val queue = (application as PdfCraftApplication).exportQueue
+        if (queue.didPickerStatePersistFail()) {
+            Log.w(TAG, "Could not persist export recovery state: ${queue.getLastPickerStatePersistError()}")
+            if (!isFinishing && !isDestroyed) Toast.makeText(this,
+                "Could not save recovery state. Keep the app open and save the staged PDF.", Toast.LENGTH_LONG).show()
         }
-        if (shouldLaunch) {
-            showSaveDestinationPicker(job)
+    }
+
+    private fun requestSaveDestination(job: ExportQueue.ExportJob) {
+        if (isFinishing || isDestroyed) return
+        val app = application as PdfCraftApplication
+        try {
+            val shouldLaunch = app.exportQueue.acquireOrEnqueuePicker(job)
+            checkPickerStatePersistence()
+            if (shouldLaunch) showSaveDestinationPicker(job)
+        } catch (e: Exception) {
+            showExportActionDialog(job, "Export recovery needs attention",
+                "Could not persist the destination request: ${e.message}. The staged PDF is retained.")
         }
     }
 
     private fun removeStagedExport(job: ExportQueue.ExportJob) {
         val app = application as PdfCraftApplication
         app.exportQueue.completeAndRemoveJob(job.transferId)
+        checkPickerStatePersistence()
     }
 
     private fun showSaveDestinationPicker(job: ExportQueue.ExportJob) {
@@ -482,7 +496,9 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Unable to launch destination picker: ${e.message}", e)
             val app = application as PdfCraftApplication
+            lastPickerLaunchedFor = null
             val (_, nextJob) = app.exportQueue.consumeCurrentAndAdvancePicker()
+            checkPickerStatePersistence()
             handleSaveCancelled(job)
             if (nextJob != null) {
                 showSaveDestinationPicker(nextJob)
@@ -540,6 +556,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                     .setNeutralButton("Keep backup") { _, _ ->
                                         app.exportQueue.cancelJob(job.transferId)
+        checkPickerStatePersistence()
                                     }
                                     .setNegativeButton("Share copy…") { _, _ ->
                                         shareStagedExport(job)
@@ -581,6 +598,7 @@ class MainActivity : ComponentActivity() {
     private fun handleSaveCancelled(job: ExportQueue.ExportJob) {
         val app = application as PdfCraftApplication
         app.exportQueue.cancelJob(job.transferId)
+        checkPickerStatePersistence()
         Log.i(TAG, "Save cancelled for ${job.transferId}, keeping staged file")
         showExportActionDialog(
             job,
@@ -660,6 +678,16 @@ class MainActivity : ComponentActivity() {
         webView.onPause()
     }
 
+    override fun onStart() {
+        super.onStart()
+        (application as PdfCraftApplication).attachExportListener(this) { job -> requestSaveDestination(job) }
+    }
+
+    override fun onStop() {
+        (application as PdfCraftApplication).detachExportListener(this)
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
         webView.onResume()
@@ -684,6 +712,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        (application as PdfCraftApplication).detachExportListener(this)
         mainHandler.removeCallbacks(startupTimeoutRunnable)
         messageBridge?.unregister()
         chromeClient?.cleanup()
@@ -712,11 +741,16 @@ class MainActivity : ComponentActivity() {
                     return
                 }
                 if (hostFailedExports > 0) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "$hostFailedExports export(s) need attention in Pending exports.",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Exports still need attention")
+                        .setMessage("$hostFailedExports export(s) have not been saved. Leaving now discards any retry data held only in the editor.")
+                        .setPositiveButton("Review export") { _, _ -> messageBridge?.sendReviewFailedExport() }
+                        .setNeutralButton("Stay", null)
+                        .setNegativeButton("Leave without saving") { _, _ ->
+                            val jobs = getAllPendingExports()
+                            if (jobs.isNotEmpty()) showPendingExportsDialog(jobs, isExitFlow = true) else finish()
+                        }.show()
+                    return
                 }
                 if (appDirty) {
                     showUnsavedChangesDialog()

@@ -7,6 +7,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileDescriptor
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
@@ -36,6 +37,14 @@ object DocumentIo {
 
     private const val Intent_FLAG_GRANT_READ = Intent.FLAG_GRANT_READ_URI_PERMISSION
     private const val Intent_FLAG_GRANT_WRITE = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+
+    /**
+     * Hook for descriptor durability sync. Defaults to direct FileDescriptor.sync()
+     * so disk-sync failures propagate rather than being swallowed, and can be overridden
+     * in unit tests for deterministic failure-injection coverage.
+     */
+    @Volatile
+    internal var syncDescriptor: (FileDescriptor) -> Unit = { fd -> fd.sync() }
 
     enum class VerificationOutcome {
         /** Provider allowed re-reading and both byte length and SHA-256 matched. */
@@ -200,9 +209,7 @@ object DocumentIo {
             FileOutputStream(tmp).use { out ->
                 out.write(data)
                 out.flush()
-                // Propagate sync failure: an unsynced temp file must not be treated as
-                // durably written, so the atomic move is skipped and the error surfaces.
-                out.fd.sync()
+                syncDescriptor(out.fd)
             }
             moveAtomically(tmp, target)
         } finally {

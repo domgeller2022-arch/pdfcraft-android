@@ -1,0 +1,4 @@
+Unofficial PdfCraft Android build. Based on upstream bbbe60015c571ebfc39708ee07777b89e267122a
+Modified for touch input, paragraph hit testing, compact layouts and bounded dialogs.
+The ArtCraft wordmark and logo are not embedded in this modified build.
+See provenance.json for source pins, patch and asset hashes.

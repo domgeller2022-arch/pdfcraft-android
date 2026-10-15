@@ -20,10 +20,12 @@
 
     // Tunable transfer limits. maxExportBytes is aligned with the native
     // ExportQueue.MAX_STAGING_BYTES (256 MiB); an export above any limit is refused
-    // AND retained for retry rather than silently dropped.
+    // and retained within the retry memory budget; otherwise a visible error tells
+    // the user to keep the document open and save again.
     const config = {
         maxExportBytes: 256 * 1024 * 1024,
         maxQueuedExportBytes: 256 * 1024 * 1024,
+        maxRetainedExportBytes: 256 * 1024 * 1024,
         // Receiver-controlled backpressure: if the native host does not acknowledge a
         // chunk within this window, the transfer fails, is retained, and is surfaced.
         ackTimeoutMs: 30000
@@ -143,6 +145,10 @@
 
             case "host:retryExport":
                 retryFailedExport(data.transferId);
+                break;
+
+            case "host:reviewFailedExport":
+                reviewFailedExport();
                 break;
 
             case "host:discardExport":
@@ -449,16 +455,23 @@
     // Retain a refused/failed export and let Android surface a visible retry workflow.
     // Nothing is dropped silently: every refusal produces a host:saveFailed message.
     function retainFailedExport(id, name, saveAs, mimeType, buffer, reason, message) {
+        const retainedBytes = Array.from(failedExports.values()).reduce((sum, tx) => sum + (tx.buffer ? tx.buffer.byteLength : 0), 0);
+        const retained = buffer.byteLength <= config.maxRetainedExportBytes && retainedBytes + buffer.byteLength <= config.maxRetainedExportBytes;
+        const error = retained ? message : message + ". Retry data could not be retained within the memory limit. Keep the document open and save again after resolving the error.";
+        // Keep a tiny failure record even when bytes cannot be retained. Back must
+        // still warn, because upstream may already have cleared its dirty flag.
         failedExports.set(id, {
-            transferId: id, name: name, saveAs: saveAs, mimeType: mimeType, buffer: buffer, reason: reason
+            transferId: id, name: name, saveAs: saveAs, mimeType: mimeType,
+            buffer: retained ? buffer : null, reason: reason, error: error
         });
-        console.error("Export retained for retry:", id, reason, "-", message);
+        console.error(retained ? "Export retained for retry:" : "Export not retained:", id, reason, "-", message);
         sendToNative({
             type: "host:saveFailed",
             transferId: id,
             name: name,
             reason: reason,
-            error: message
+            retained: retained,
+            error: error
         });
         notifyPendingWork();
     }
@@ -582,12 +595,20 @@
 
     function retryFailedExport(transferId) {
         const entry = failedExports.get(transferId);
-        if (!entry) return;
+        if (!entry || !entry.buffer) return;
         failedExports.delete(transferId);
         // Re-send under a fresh id so native per-transfer staging state starts clean.
         transferBytesToNative(generateSaveId("retry_"), entry.name, entry.saveAs,
             entry.mimeType, entry.buffer, "host:save");
         notifyPendingWork();
+    }
+
+    function reviewFailedExport() {
+        const entry = failedExports.values().next().value;
+        if (!entry) return;
+        sendToNative({type: "host:saveFailed", transferId: entry.transferId,
+            name: entry.name, reason: entry.reason, error: entry.error,
+            retained: !!entry.buffer});
     }
 
     function discardFailedExport(transferId) {

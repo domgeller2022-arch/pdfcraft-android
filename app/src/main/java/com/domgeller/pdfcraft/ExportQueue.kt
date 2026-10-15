@@ -267,6 +267,10 @@ class ExportQueue(
     // result and its ExportJob.
     private var activePickerJobId: String? = null
     private val pickerQueueIds = ArrayDeque<String>()
+    @Volatile
+    private var pickerStatePersistFailed: Boolean = false
+    @Volatile
+    private var lastPickerStatePersistError: String? = null
 
     init {
         restorePickerState()
@@ -408,14 +412,18 @@ class ExportQueue(
             )
         }
 
-        FileOutputStream(partFile, true).use { out ->
-            out.write(data)
-            if (seq + 1 == totalChunks) {
-                out.flush()
-                // Propagate sync failure: an unsynced final chunk must not be finalized
-                // as durable. The caller converts the IOException into a visible error.
-                out.fd.sync()
+        try {
+            FileOutputStream(partFile, true).use { out ->
+                out.write(data)
+                if (seq + 1 == totalChunks) {
+                    out.flush()
+                    DocumentIo.syncDescriptor(out.fd)
+                }
             }
+        } catch (e: IOException) {
+            chunkTransfers.remove(transferId)
+            runCatching { partFile.delete() }
+            throw e
         }
 
         state.expectedSeq = seq + 1
@@ -576,66 +584,73 @@ class ExportQueue(
     @Synchronized
     fun getQueuedPickerIds(): List<String> = pickerQueueIds.toList()
 
-    @Volatile
-    private var pickerStatePersistFailed = false
-
-    /**
-     * True if the most recent picker-state write failed. Picker association is a
-     * best-effort persistence (also recoverable from job metadata), so failures are
-     * recorded and surfaced to the user rather than silently swallowed.
-     */
     fun didPickerStatePersistFail(): Boolean = pickerStatePersistFailed
 
+    fun getLastPickerStatePersistError(): String? = lastPickerStatePersistError
+
     @Synchronized
-    private fun savePickerState(): Boolean {
-        metadataDir.mkdirs()
+    private fun savePickerState() {
         val file = File(metadataDir, PICKER_STATE_FILE)
         val content = buildString {
             append("active=").append(activePickerJobId.orEmpty()).append('\n')
             append("queue=").append(pickerQueueIds.joinToString(","))
         }
-        return try {
+        try {
+            metadataDir.mkdirs()
             DocumentIo.writeAtomically(file, content.toByteArray(Charsets.UTF_8))
             pickerStatePersistFailed = false
-            true
+            lastPickerStatePersistError = null
         } catch (e: Exception) {
             pickerStatePersistFailed = true
-            Log.e(TAG, "Failed to persist picker state: ${e.message}", e)
-            false
+            lastPickerStatePersistError = e.message ?: "Unable to persist picker state"
+            Log.e(TAG, "Failed to persist picker state to ${file.absolutePath}: ${e.message}", e)
         }
     }
 
     @Synchronized
     private fun restorePickerState() {
         val file = File(metadataDir, PICKER_STATE_FILE)
-        if (!file.exists()) {
-            // Fallback: if any recovered job had status AWAITING_DESTINATION, set it as active
-            val awaiting = recoveredJobs.values.firstOrNull { it.status == ExportStatus.AWAITING_DESTINATION }
-            if (awaiting != null) {
-                activePickerJobId = awaiting.transferId
+        if (file.exists()) {
+            try {
+                val map = file.readLines()
+                    .mapNotNull { line ->
+                        val eqIdx = line.indexOf('=')
+                        if (eqIdx > 0) line.substring(0, eqIdx) to line.substring(eqIdx + 1) else null
+                    }
+                    .toMap()
+                val active = map["active"]?.takeIf { it.isNotBlank() && getJob(it) != null }
+                val queued = map["queue"]
+                    ?.split(',')
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() && getJob(it) != null }
+                    .orEmpty()
+                activePickerJobId = active
+                pickerQueueIds.clear()
+                for (q in queued) {
+                    if (q != active && !pickerQueueIds.contains(q)) {
+                        pickerQueueIds.addLast(q)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to read $PICKER_STATE_FILE: ${e.message}", e)
             }
-            return
         }
-        runCatching {
-            val map = file.readLines()
-                .mapNotNull { line ->
-                    val eq = line.indexOf('=')
-                    if (eq > 0) line.substring(0, eq) to line.substring(eq + 1) else null
-                }
-                .toMap()
-            val active = map["active"]?.takeIf { it.isNotBlank() && getJob(it) != null }
-            val queued = map["queue"]
-                ?.split(',')
-                ?.map { it.trim() }
-                ?.filter { it.isNotBlank() && getJob(it) != null }
-                .orEmpty()
-            activePickerJobId = active
-            pickerQueueIds.clear()
-            for (q in queued) {
-                if (q != active && !pickerQueueIds.contains(q)) {
-                    pickerQueueIds.addLast(q)
-                }
-            }
+        if (activePickerJobId == null) {
+            // Prefer the saved queue order; otherwise recover deterministically.
+            activePickerJobId = pickerQueueIds.firstOrNull { getJob(it) != null }
+                ?: recoveredJobs.values
+                    .filter { it.status == ExportStatus.AWAITING_DESTINATION }
+                    .sortedWith(compareBy<ExportJob> { it.createdAt }.thenBy { it.transferId })
+                    .firstOrNull()?.transferId
+        }
+        activePickerJobId?.let { pickerQueueIds.remove(it) }
+    }
+
+    private fun persistStatus(job: ExportJob) {
+        try { job.saveMetadata(metadataDir) } catch (e: Exception) {
+            pickerStatePersistFailed = true
+            lastPickerStatePersistError = e.message ?: "Could not persist export status"
+            Log.e(TAG, "Export status remains in memory; staged PDF retained", e)
         }
     }
 
@@ -643,7 +658,7 @@ class ExportQueue(
         val job = getJob(transferId)
         if (job != null) {
             job.status = ExportStatus.CANCELLED
-            job.saveMetadata(metadataDir)
+            persistStatus(job)
             Log.i(TAG, "Cancelled export $transferId")
         }
     }
@@ -652,7 +667,7 @@ class ExportQueue(
         val job = getJob(transferId)
         if (job != null) {
             job.status = ExportStatus.FAILED
-            job.saveMetadata(metadataDir)
+            persistStatus(job)
             Log.w(TAG, "Marked export failed (preserved for retry): $transferId")
         }
     }

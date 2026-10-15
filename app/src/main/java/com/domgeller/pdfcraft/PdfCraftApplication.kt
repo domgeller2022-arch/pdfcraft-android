@@ -1,6 +1,8 @@
 package com.domgeller.pdfcraft
 
 import android.app.Application
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -38,6 +40,27 @@ class PdfCraftApplication : Application() {
         Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "PdfCraft-IO").apply { isDaemon = true }
         }
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var exportOwner: Any? = null
+    private var exportListener: ((ExportQueue.ExportJob) -> Unit)? = null
+
+    fun attachExportListener(owner: Any, listener: (ExportQueue.ExportJob) -> Unit) {
+        exportOwner = owner
+        exportListener = listener
+        // Also pick up work completed while no Activity was listening.
+        exportQueue.getAllPendingJobs().values
+            .filter { it.status == ExportQueue.ExportStatus.STAGING_DURABLE }
+            .sortedBy { it.createdAt }.forEach(listener)
+    }
+
+    fun detachExportListener(owner: Any) {
+        if (exportOwner === owner) { exportOwner = null; exportListener = null }
+    }
+
+    fun notifyExportStaged(job: ExportQueue.ExportJob) {
+        mainHandler.post { exportListener?.invoke(job) }
     }
 
     override fun onCreate() {

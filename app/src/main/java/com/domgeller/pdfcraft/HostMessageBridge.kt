@@ -45,7 +45,7 @@ class HostMessageBridge(
         fun onDirtyChanged(dirty: Boolean)
         fun onAppFailed(error: String)
         /** host.js refused/failed a transfer but RETAINED it (oversize, queue-full, ack timeout, native reject). */
-        fun onSaveFailed(transferId: String, name: String, reason: String, error: String?)
+        fun onSaveFailed(transferId: String, name: String, reason: String, error: String?, retained: Boolean)
         /** host.js still holds queued/active/retained transfers not yet staged natively. */
         fun onPendingWork(queued: Int, active: Int, failed: Int, queuedBytes: Long)
     }
@@ -220,7 +220,8 @@ class HostMessageBridge(
                     json.optString("transferId", ""),
                     json.optString("name", "document.pdf"),
                     json.optString("reason", "unknown"),
-                    json.optString("error", "").takeIf { it.isNotBlank() }
+                    json.optString("error", "").takeIf { it.isNotBlank() },
+                    json.optBoolean("retained", true)
                 )
             }
 
@@ -402,6 +403,10 @@ class HostMessageBridge(
             put("type", "host:discardExport")
             put("transferId", transferId)
         }.toString())
+    }
+
+    fun sendReviewFailedExport() {
+        sendToHost(JSONObject().put("type", "host:reviewFailedExport").toString())
     }
 
     fun isAppReady(): Boolean = appReady
