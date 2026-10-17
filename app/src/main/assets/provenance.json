@@ -1,12 +1,12 @@
 {
   "upstream_commit": "bbbe60015c571ebfc39708ee07777b89e267122a",
   "fonts_commit": "8dcdacd5153e64560d109541a47d806f26f048c0",
-  "phone_patch_sha256": "12776fc3b26c8254f74052628bcbbe96a5d83cec27b84bcb8f8c82fd833bb0a8",
+  "phone_patch_sha256": "83979c04c40e90e51cd77105dd4d5d45b107c1bb9b64e1bd88ed5bfefe70f5a0",
   "cargo_lock_sha256": "2df3987bb56b353fbc6ac3377a8c46371c04c8d52ea01bd9363e97c8a6d86ae1",
   "modified_upstream": true,
   "assets": {
-    "index.html": "fb3fc41f255e69c38aed040a9b9a9b1db63a1cecc145d40e95cbf9623b4b10d7",
-    "pdfcraft-web-928b3c1f8ff22c1b.js": "5508d96e574f78f76c163d649d8b295ae01cb66f46222c9d2fdce637e8b04a94",
-    "pdfcraft-web-928b3c1f8ff22c1b_bg.wasm": "6eb9c15e6d28907513b5e0e74a0704f542a795f4ff9d49f3cf253ed5f7aae87c"
+    "index.html": "9b35b7a1514b75b4e81acbf9ae91fec6023c3fc17415d74b504908383414baee",
+    "pdfcraft-web-6e8b2e134d09bce6.js": "5508d96e574f78f76c163d649d8b295ae01cb66f46222c9d2fdce637e8b04a94",
+    "pdfcraft-web-6e8b2e134d09bce6_bg.wasm": "869f68fbeb463bce7b5141012a2a12f2151a95665dbba652f39bf4653a540002"
   }
 }

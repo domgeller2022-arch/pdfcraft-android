@@ -1,5 +1,5 @@
 diff --git a/ROADMAP.md b/ROADMAP.md
-index 9e528c6..50f61af 100644
+index 9e528c62..50f61af2 100644
 --- a/ROADMAP.md
 +++ b/ROADMAP.md
 @@ -1,15 +1,13 @@
@@ -331,7 +331,7 @@ index 9e528c6..50f61af 100644
 +
 +Touch release hit testing, paragraph-over-image priority and compact viewport presentation are implemented in the Android build patch. The saved desktop docking layout is preserved. WASM compilation passes; physical Fold7/IME and release acceptance remain pending. This does not change upstream PDF-format parity claims.
 diff --git a/apps/pdfcraft-web/index.html b/apps/pdfcraft-web/index.html
-index 46b3a25..0982140 100644
+index 46b3a25e..09821404 100644
 --- a/apps/pdfcraft-web/index.html
 +++ b/apps/pdfcraft-web/index.html
 @@ -4,7 +4,7 @@
@@ -344,7 +344,7 @@ index 46b3a25..0982140 100644
        html, body { margin: 0; height: 100%; overflow: hidden; background: #f1f1f3; }
        canvas { width: 100%; height: 100%; display: block; outline: none; }
 diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
-index bf66f87..1009b4e 100644
+index bf66f873..1009b4e3 100644
 --- a/crates/ui-egui/src/canvas.rs
 +++ b/crates/ui-egui/src/canvas.rs
 @@ -2298,9 +2298,19 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
@@ -380,7 +380,7 @@ index bf66f87..1009b4e 100644
                          app.quick_tool = QuickTool::Select;
                      }
 diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
-index 0591fe6..9272967 100644
+index 0591fe67..9272967f 100644
 --- a/crates/ui-egui/src/chrome.rs
 +++ b/crates/ui-egui/src/chrome.rs
 @@ -7,6 +7,10 @@ use crate::theme::{self, ThemePreference, Tokens};
@@ -426,7 +426,7 @@ index 0591fe6..9272967 100644
      let Some((index, id)) = app.active_ids() else { return };
      let Some(doc) = app.session.get(id) else { return };
 diff --git a/crates/ui-egui/src/comments.rs b/crates/ui-egui/src/comments.rs
-index bce3d18..1da8c2c 100644
+index bce3d18d..1da8c2c5 100644
 --- a/crates/ui-egui/src/comments.rs
 +++ b/crates/ui-egui/src/comments.rs
 @@ -1368,9 +1368,11 @@ pub enum CanvasAction {
@@ -453,10 +453,10 @@ index bce3d18..1da8c2c 100644
          }
 diff --git a/crates/ui-egui/src/compact.rs b/crates/ui-egui/src/compact.rs
 new file mode 100644
-index 0000000..2d6084b
+index 00000000..b8aee61a
 --- /dev/null
 +++ b/crates/ui-egui/src/compact.rs
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,200 @@
 +//! Narrow-window presentation. The saved desktop docking tree is never rewritten.
 +use crate::{Mode, PdfCraftApp, RightPanel, canvas, icons, panels, theme};
 +use egui::{Align, Layout, vec2};
@@ -649,10 +649,16 @@ index 0000000..2d6084b
 +        || (selected == Drawer::Inspector && app.right.is_none())
 +    {
 +        drawer(ctx, None);
++        // Choosing a tool here runs a command that queues its own Tools reveal
++        // (`reveal_tools`). On a phone the drawer *is* that panel, so drop the reveal,
++        // or the drawer reopens over the page on the next frame.
++        if old_tool != app.quick_tool {
++            app.pending_panel_reveals.retain(|p| *p != crate::docking::Panel::Tools);
++        }
 +    }
 +}
 diff --git a/crates/ui-egui/src/content_ui.rs b/crates/ui-egui/src/content_ui.rs
-index 1dab43e..f098eba 100644
+index 1dab43e3..f098eba5 100644
 --- a/crates/ui-egui/src/content_ui.rs
 +++ b/crates/ui-egui/src/content_ui.rs
 @@ -415,7 +415,7 @@ fn finish(cv: &mut ContentView, d: TextDraft, added: &[Added]) -> Option<Edit> {
@@ -683,7 +689,7 @@ index 1dab43e..f098eba 100644
              }
          }
 diff --git a/crates/ui-egui/src/dialogs.rs b/crates/ui-egui/src/dialogs.rs
-index 1da3a21..9f6effd 100644
+index 1da3a215..9f6effdb 100644
 --- a/crates/ui-egui/src/dialogs.rs
 +++ b/crates/ui-egui/src/dialogs.rs
 @@ -63,1070 +63,1107 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
@@ -2790,7 +2796,7 @@ index 1da3a21..9f6effd 100644
              ui.add(crate::icons::image("lock", 22.0, t.accent));
              ui.label(egui::RichText::new(tl!("Password required")).font(theme::semibold(17.0)));
 diff --git a/crates/ui-egui/src/edit_text_ui.rs b/crates/ui-egui/src/edit_text_ui.rs
-index 556d0b3..b4801a0 100644
+index 556d0b38..b4801a0c 100644
 --- a/crates/ui-egui/src/edit_text_ui.rs
 +++ b/crates/ui-egui/src/edit_text_ui.rs
 @@ -202,6 +202,11 @@ pub struct ImageSelection {
@@ -2970,7 +2976,7 @@ index 556d0b3..b4801a0 100644
          Some(apply) => {
              let ed = view.line_editor.take()?;
 diff --git a/crates/ui-egui/src/home.rs b/crates/ui-egui/src/home.rs
-index 2b689fe..e9c2241 100644
+index 2b689fef..e9c2241e 100644
 --- a/crates/ui-egui/src/home.rs
 +++ b/crates/ui-egui/src/home.rs
 @@ -11,8 +11,10 @@ const RECOMMENDED: [&str; 5] = ["organize", "comment", "form", "edit", "protect"
@@ -3004,7 +3010,7 @@ index 2b689fe..e9c2241 100644
                          }
                          let (rect, resp) = ui.allocate_exact_size(vec2(170.0, 104.0), Sense::click());
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 372cf8b..711d794 100644
+index 372cf8b8..711d7945 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
 @@ -27,6 +27,7 @@ mod actions_ui;
@@ -3033,7 +3039,7 @@ index 372cf8b..711d794 100644
          palette::show(self, &ctx);
          dialogs::show(self, &ctx);
 diff --git a/crates/ui-egui/src/marks_ui.rs b/crates/ui-egui/src/marks_ui.rs
-index c92ae1f..8e70df8 100644
+index c92ae1f6..8e70df82 100644
 --- a/crates/ui-egui/src/marks_ui.rs
 +++ b/crates/ui-egui/src/marks_ui.rs
 @@ -154,228 +154,249 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
@@ -3488,7 +3494,7 @@ index c92ae1f..8e70df8 100644
      });
      ui.add_space(10.0);
 diff --git a/crates/ui-egui/src/palette.rs b/crates/ui-egui/src/palette.rs
-index f11e1c1..935cf81 100644
+index f11e1c15..935cf81a 100644
 --- a/crates/ui-egui/src/palette.rs
 +++ b/crates/ui-egui/src/palette.rs
 @@ -130,8 +130,11 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
@@ -3555,7 +3561,7 @@ index f11e1c1..935cf81 100644
                      ui.label(egui::RichText::new(tl!("No matching tools")).color(t.text_muted));
                  }
 diff --git a/crates/ui-egui/src/widgets.rs b/crates/ui-egui/src/widgets.rs
-index 21448bd..74287bc 100644
+index 21448bdc..74287bc0 100644
 --- a/crates/ui-egui/src/widgets.rs
 +++ b/crates/ui-egui/src/widgets.rs
 @@ -223,24 +223,12 @@ pub fn progress_notice(app: &PdfCraftApp, ctx: &egui::Context) -> bool {
@@ -3587,10 +3593,10 @@ index 21448bd..74287bc 100644
  
  /// Buttons for every community link (`pdfcraft_engine::links`), Discord first and prominent.
 diff --git a/crates/ui-egui/tests/editing.rs b/crates/ui-egui/tests/editing.rs
-index 518399f..e65f23b 100644
+index 518399f9..85699905 100644
 --- a/crates/ui-egui/tests/editing.rs
 +++ b/crates/ui-egui/tests/editing.rs
-@@ -2254,3 +2254,163 @@ fn host_dirty_hears_when_unsaved_work_appears_and_goes() {
+@@ -2254,3 +2254,183 @@ fn host_dirty_hears_when_unsaved_work_appears_and_goes() {
      assert_eq!(reports.lock().unwrap().last(), Some(&false), "saving clears it");
      let _ = std::fs::remove_file(out);
  }
@@ -3754,8 +3760,28 @@ index 518399f..e65f23b 100644
 +    assert_eq!(doc.text_lines(0)[0].text, "Page 1");
 +    assert_eq!(doc.can_undo(), None, "Cancel must not apply on pointer-down focus loss");
 +}
++
++#[test]
++fn mobile_choosing_edit_text_from_drawer_returns_to_the_page() {
++    // The real phone path: open the drawer, pick Edit a PDF, then Edit text & images.
++    let mut h = Harness::builder().with_size(egui::vec2(380.0, 840.0)).build_eframe(|_| {
++        let mut app = PdfCraftApp::new();
++        app.set_option("language", "en").unwrap();
++        app.open_bytes("phone.pdf", None, fixture(1)).unwrap();
++        app
++    });
++    h.run_steps(5);
++    h.get_by_label("Tools and text formatting").click();
++    h.run_steps(3);
++    h.get_by_label_contains("Edit a PDF").click();
++    h.run_steps(3);
++    h.get_by_label_contains("Edit text & images").click();
++    h.run_steps(6);
++    assert_eq!(h.state().quick_tool, pdfcraft_ui_egui::QuickTool::EditText);
++    assert!(h.query_by_label("Back to document").is_none(), "the drawer must stay closed after choosing a tool");
++}
 diff --git a/docs/roadmap.md b/docs/roadmap.md
-index aed24a3..e8546a7 100644
+index aed24a3d..e8546a7c 100644
 --- a/docs/roadmap.md
 +++ b/docs/roadmap.md
 @@ -125,3 +125,8 @@ M2 (renderer), M7 (content editing), M10 (OCR and Office), M11 (Preflight and st
