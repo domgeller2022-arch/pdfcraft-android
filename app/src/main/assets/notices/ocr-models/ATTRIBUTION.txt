@@ -1,0 +1,6 @@
+Scan & OCR models built into this app (pdfcraft-web WASM):
+  text-detection.rten, text-recognition.rten
+  Ocrs models by Robert Knight (ocrs-models; trained on HierText)
+  https://github.com/robertknight/ocrs-models  https://huggingface.co/robertknight/ocrs
+  Licence: CC-BY-SA-4.0 https://creativecommons.org/licenses/by-sa/4.0/legalcode
+  Unmodified.

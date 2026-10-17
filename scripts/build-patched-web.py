@@ -18,6 +18,37 @@ PATCH = ROOT / "patches/pdfcraft-fold7.patch"
 SOURCE = ROOT / "build/patched-upstream"
 WEB = ROOT / "build/web"
 ASSETS = ROOT / "app/src/main/assets"
+# Scan & OCR models built into the WASM (the web build has no file system to find them in).
+# SHA-256 as pinned in upstream ATTRIBUTION.toml; fetch them with `cargo xtask models DIR` or
+# from the URLs there. PDFCRAFT_OCR_MODELS_DIR=none builds without OCR.
+OCR_MODELS = {
+    "text-detection.rten": "f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca",
+    "text-recognition.rten": "e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e",
+}
+OCR_MODELS_ATTRIBUTION = (
+    "Scan & OCR models built into this app (pdfcraft-web WASM):\n"
+    "  text-detection.rten, text-recognition.rten\n"
+    "  Ocrs models by Robert Knight (ocrs-models; trained on HierText)\n"
+    "  https://github.com/robertknight/ocrs-models  https://huggingface.co/robertknight/ocrs\n"
+    "  Licence: CC-BY-SA-4.0 https://creativecommons.org/licenses/by-sa/4.0/legalcode\n"
+    "  Unmodified.\n"
+)
+
+def ocr_models_dir():
+    """The verified OCR model folder, or None when OCR is deliberately left out."""
+    value = os.environ.get("PDFCRAFT_OCR_MODELS_DIR", "")
+    if value == "none":
+        return None
+    if not value:
+        raise SystemExit("Set PDFCRAFT_OCR_MODELS_DIR to the folder holding the OCR models (or to 'none' to build without OCR)")
+    folder = Path(value).resolve()
+    for name, expected in OCR_MODELS.items():
+        path = folder / name
+        if not path.is_file():
+            raise SystemExit("Missing OCR model " + str(path))
+        if sha(path) != expected:
+            raise SystemExit("OCR model " + name + " does not match its pinned SHA-256; download it again")
+    return folder
 
 def run(*args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
@@ -57,6 +88,9 @@ def package_notices():
         revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
         if revision in git_revisions:
             copy_notices(checkout, "dependencies/git-" + checkout.parent.name + "-" + revision)
+    if os.environ.get("PDFCRAFT_OCR_MODELS_DIR", "") not in ("", "none"):
+        (notices / "ocr-models").mkdir(parents=True, exist_ok=True)
+        (notices / "ocr-models/ATTRIBUTION.txt").write_text(OCR_MODELS_ATTRIBUTION)
     (notices / "ANDROID-MODIFICATIONS.txt").write_text(
         "Unofficial PdfCraft Android build. Based on upstream " + PIN + "\n"
         "Modified for touch input, paragraph hit testing, compact layouts and bounded dialogs.\n"
@@ -75,12 +109,15 @@ def package_web_assets():
         "upstream_commit": PIN, "fonts_commit": FONTS_PIN,
         "phone_patch_sha256": sha(PATCH), "cargo_lock_sha256": sha(SOURCE / "Cargo.lock"),
         "modified_upstream": True,
+        "wasm_simd": os.environ.get("PDFCRAFT_WASM_SIMD") == "1",
+        "ocr_models": OCR_MODELS if os.environ.get("PDFCRAFT_OCR_MODELS_DIR", "") not in ("", "none") else None,
         "assets": {str(p.relative_to(destination)): sha(p) for p in sorted(destination.rglob("*")) if p.is_file()},
     }
     (ASSETS / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
 def main():
     run(sys.executable, ROOT / "scripts/verify-upstream.py", UPSTREAM)
+    models = ocr_models_dir()  # check before the long build
     fonts_head = subprocess.check_output(["git", "-C", str(FONTS), "rev-parse", "HEAD"], text=True).strip()
     if fonts_head != FONTS_PIN:
         raise SystemExit("craft-fonts does not match the pinned revision")
@@ -98,6 +135,14 @@ def main():
     env = dict(os.environ, CRAFT_FONTS_DIR=str(FONTS), CRAFT_FONTS_REQUIRED="1")
     env["NO_COLOR"] = "true"  # Trunk 0.21 expects a boolean, not the common NO_COLOR=1.
     env["CARGO_TARGET_DIR"] = os.environ.get("PDFCRAFT_CARGO_TARGET_DIR", str(ROOT / "build/rust-target"))
+    # Optional: WASM SIMD makes text recognition several times faster (Android System WebView
+    # has supported it since Chrome 91). Off unless PDFCRAFT_WASM_SIMD=1.
+    if os.environ.get("PDFCRAFT_WASM_SIMD") == "1":
+        env["CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS"] = "-C target-feature=+simd128"
+    if models is not None:
+        env["PDFCRAFT_EMBED_MODELS_DIR"] = str(models)
+    else:
+        env.pop("PDFCRAFT_EMBED_MODELS_DIR", None)
     run("trunk", "build", "--skip-version-check", "--release", "--locked", "--dist", WEB, cwd=SOURCE / "apps/pdfcraft-web", env=env)
     package_web_assets()
     run(sys.executable, ROOT / "scripts/verify-upstream.py", UPSTREAM)
